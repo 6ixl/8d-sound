@@ -1,7 +1,6 @@
 """8D Sound — превращает любой звук Windows в 8D."""
 import math
 import os
-import subprocess
 import sys
 
 import numpy as np
@@ -9,9 +8,9 @@ from PySide6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath,
                            QPen, QPixmap, QRadialGradient)
 from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow,
-                               QPushButton, QSlider, QVBoxLayout, QWidget)
+                               QPushButton, QSlider, QVBoxLayout, QWidget, QFileDialog)
 
-from engine import PATTERNS, Engine
+from engine import PATTERNS, Engine, demo_track
 import winaudio
 
 VIOLET = QColor("#a855f7")
@@ -201,6 +200,36 @@ class SpacePad(QWidget):
             p.drawEllipse(s, 9, 9)
 
 
+class Meter(QWidget):
+    def __init__(self, getter):
+        super().__init__()
+        self.getter = getter
+        self.v = 0.0
+        self.setFixedHeight(8)
+
+    def tick(self):
+        lvl = min(1.0, math.sqrt(max(self.getter(), 0.0)) * 2.2)
+        self.v = max(lvl, self.v * 0.9)
+        self.update()
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(Qt.NoPen)
+        p.setBrush(QColor(168, 85, 247, 40))
+        p.drawRoundedRect(self.rect(), 4, 4)
+        g = QLinearGradient(0, 0, self.width(), 0)
+        g.setColorAt(0, QColor("#7c3aed"))
+        g.setColorAt(1, QColor("#e879f9"))
+        p.setBrush(g)
+        p.drawRoundedRect(QRectF(0, 0, self.width() * self.v, self.height()), 4, 4)
+
+
+def fmt_time(sec):
+    sec = int(sec)
+    return f"{sec // 60}:{sec % 60:02d}"
+
+
 def labeled_slider(title, lo, hi, val, fmt):
     box = QVBoxLayout()
     box.setSpacing(4)
@@ -280,7 +309,39 @@ class Main(QMainWindow):
         hint.setObjectName("hint")
         hint.setAlignment(Qt.AlignCenter)
         left.addWidget(hint)
+
+        pc, pl = card()
+        top = QHBoxLayout()
+        self.bplay = QPushButton("▶")
+        self.bplay.setObjectName("seg")
+        self.bplay.setFixedSize(58, 58)
+        self.bplay.setCursor(Qt.PointingHandCursor)
+        self.bplay.clicked.connect(self.play_pause)
+        top.addWidget(self.bplay)
+        info = QVBoxLayout()
+        self.track_lbl = QLabel("Файл не выбран — открой музыку или перетащи её в окно")
+        self.track_lbl.setObjectName("value")
+        self.time_lbl = QLabel("0:00 / 0:00")
+        self.time_lbl.setObjectName("hint")
+        info.addWidget(self.track_lbl)
+        info.addWidget(self.time_lbl)
+        top.addLayout(info, 1)
+        bopen = QPushButton("📂  Открыть")
+        bopen.setCursor(Qt.PointingHandCursor)
+        bopen.clicked.connect(self.open_file)
+        btest = QPushButton("🎧  Тест 8D")
+        btest.setCursor(Qt.PointingHandCursor)
+        btest.clicked.connect(self.play_demo)
+        top.addWidget(bopen)
+        top.addWidget(btest)
+        pl.addLayout(top)
+        self.seek = QSlider(Qt.Horizontal)
+        self.seek.setRange(0, 1000)
+        self.seek.sliderReleased.connect(self.do_seek)
+        pl.addWidget(self.seek)
+        left.addWidget(pc)
         main.addLayout(left, 3)
+        self.setAcceptDrops(True)
 
         # ---- правая колонка ----
         right = QVBoxLayout()
@@ -339,11 +400,21 @@ class Main(QMainWindow):
         sec = QLabel("ЗВУК")
         sec.setObjectName("section")
         l3.addWidget(sec)
+        src = QHBoxLayout()
+        self.bsys = QPushButton("🖥  Весь звук ПК")
+        self.bfile = QPushButton("🎵  Файл")
+        for b in (self.bsys, self.bfile):
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            src.addWidget(b)
+        self.bsys.clicked.connect(lambda: self.set_source("system"))
+        self.bfile.clicked.connect(lambda: self.set_source("file"))
+        l3.addLayout(src)
         self.cin = QComboBox()
         self.cout = QComboBox()
-        lab = QLabel("Откуда брать (VB-Cable Output)")
-        lab.setObjectName("hint")
-        l3.addWidget(lab)
+        self.cin_lbl = QLabel("Откуда брать (VB-Cable Output)")
+        self.cin_lbl.setObjectName("hint")
+        l3.addWidget(self.cin_lbl)
         l3.addWidget(self.cin)
         lab = QLabel("Куда выводить (твои наушники)")
         lab.setObjectName("hint")
@@ -360,6 +431,16 @@ class Main(QMainWindow):
         row.addWidget(win, 1)
         row.addWidget(ref)
         l3.addLayout(row)
+        for name, getter in (("Вход", lambda: self.engine.in_level), ("Выход 8D", lambda: self.engine.level)):
+            r = QHBoxLayout()
+            lb = QLabel(name)
+            lb.setObjectName("hint")
+            lb.setFixedWidth(62)
+            m = Meter(getter)
+            self.meters = getattr(self, "meters", []) + [m]
+            r.addWidget(lb)
+            r.addWidget(m, 1)
+            l3.addLayout(r)
         right.addWidget(c3)
 
         self.power = QPushButton()
@@ -381,7 +462,7 @@ class Main(QMainWindow):
         self.cout.currentIndexChanged.connect(self.devices_changed)
 
         self.timer = QTimer(self)
-        self.timer.timeout.connect(self.pad.tick)
+        self.timer.timeout.connect(self.tick)
         self.timer.start(16)
         self.refresh()
 
@@ -414,6 +495,7 @@ class Main(QMainWindow):
             name = s.value(key, "")
             if name and combo.findText(name) >= 0:
                 combo.setCurrentText(name)
+        self.engine.source = s.value("source", "system")
         self.engine.mode_8d = s.value("mode8d", "true") == "true"
         self.engine.auto = s.value("auto", "true") == "true"
 
@@ -426,6 +508,7 @@ class Main(QMainWindow):
         s.setValue("pattern", self.pattern.currentIndex())
         s.setValue("in", self.cin.currentText())
         s.setValue("out", self.cout.currentText())
+        s.setValue("source", self.engine.source)
         s.setValue("mode8d", "true" if self.engine.mode_8d else "false")
         s.setValue("auto", "true" if self.engine.auto else "false")
         self.engine.stop()
@@ -443,6 +526,7 @@ class Main(QMainWindow):
         self.engine.mode_8d = True
         self.engine.auto = True
         self.engine.error = ""
+        self.set_source("system")
         self.settings.clear()
         self.load_devices()
         self.refresh()
@@ -469,14 +553,119 @@ class Main(QMainWindow):
             self.start()
 
     def start(self):
-        if self.cin.currentData() is None or self.cout.currentData() is None:
-            self.engine.error = "Не найдено устройство. Установи VB-Cable (vb-audio.com/Cable)."
-        elif self.cin.currentData() is not None and "CABLE" in self.cout.currentText():
-            self.engine.error = "Выход не должен быть CABLE — выбери наушники."
-        else:
-            if self.engine.start(self.cin.currentData(), self.cout.currentData()):
-                self.route_windows(True)
+        e = self.engine
+        if self.cout.currentData() is None:
+            e.error = "Не найдено устройство вывода."
+        elif "CABLE" in self.cout.currentText():
+            e.error = "Выход не должен быть CABLE — выбери наушники."
+        elif e.source == "file":
+            self.route_windows(False)
+            e.start_file(self.cout.currentData())
+        elif self.cin.currentData() is None:
+            e.error = "Не найден VB-Cable. Установи его (vb-audio.com/Cable) или выбери «Файл»."
+        elif e.start(self.cin.currentData(), self.cout.currentData()):
+            self.route_windows(True)
+        self.silent_ticks = 0
         self.refresh()
+
+    def set_source(self, src):
+        if self.engine.source == src:
+            self.refresh()
+            return
+        was = self.engine.running
+        self.engine.stop()
+        self.engine.source = src
+        if src == "system":
+            self.engine.playing = False
+        if was:
+            self.start()
+        else:
+            self.route_windows(False)
+        self.refresh()
+
+    # ---------- плеер ----------
+    def load_path(self, path):
+        import soundfile as sf
+        try:
+            data, sr = sf.read(path, dtype="float32", always_2d=True)
+        except Exception as ex:  # noqa: BLE001
+            self.engine.error = f"Не удалось открыть файл: {ex}"
+            self.refresh()
+            return
+        self.engine.load_track(data, sr, os.path.splitext(os.path.basename(path))[0])
+        self.begin_playback()
+
+    def open_file(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Открыть музыку", self.settings.value("lastdir", ""),
+                                              "Аудио (*.mp3 *.wav *.flac *.ogg *.opus *.aiff)")
+        if path:
+            self.settings.setValue("lastdir", os.path.dirname(path))
+            self.load_path(path)
+
+    def play_demo(self):
+        self.engine.load_track(demo_track(), 48000, "Тестовый луп 8D")
+        self.begin_playback()
+
+    def begin_playback(self):
+        self.engine.playing = True
+        if self.engine.source != "file" or not self.engine.running:
+            self.engine.source = "file"
+            self.start()
+        self.refresh()
+
+    def play_pause(self):
+        e = self.engine
+        if e.track is None:
+            self.open_file()
+            return
+        if e.source != "file" or not e.running:
+            self.begin_playback()
+        else:
+            e.playing = not e.playing
+        self.refresh()
+
+    def do_seek(self):
+        e = self.engine
+        if e.track is not None:
+            e.track_pos = int(len(e.track) * self.seek.value() / 1000)
+
+    def keyPressEvent(self, ev):
+        if ev.key() == Qt.Key_Space:
+            self.play_pause()
+        else:
+            super().keyPressEvent(ev)
+
+    def dragEnterEvent(self, ev):
+        if ev.mimeData().hasUrls():
+            ev.acceptProposedAction()
+
+    def dropEvent(self, ev):
+        urls = ev.mimeData().urls()
+        if urls:
+            self.load_path(urls[0].toLocalFile())
+
+    def tick(self):
+        self.pad.tick()
+        for m in self.meters:
+            m.tick()
+        e = self.engine
+        if e.track is not None:
+            total = len(e.track) / e.track_sr
+            self.time_lbl.setText(f"{fmt_time(e.track_pos / e.track_sr)} / {fmt_time(total)}")
+            if not self.seek.isSliderDown():
+                self.seek.setValue(int(1000 * e.track_pos / max(1, len(e.track))))
+        playing = e.running and e.source == "file" and e.playing
+        if self.bplay.text() != ("❚❚" if playing else "▶"):
+            self.bplay.setText("❚❚" if playing else "▶")
+        # диагностика: режим «весь ПК», а сигнала с кабеля нет
+        if e.running and e.source == "system" and not e.error:
+            self.silent_ticks = 0 if e.in_level > 0.0005 else getattr(self, "silent_ticks", 0) + 1
+            if self.silent_ticks == 180:
+                self.status.setText("⚠  Сигнала нет. Включи музыку; если играет — перезапусти плеер "
+                                    "(он остался на старом устройстве) или жми «🎵 Файл».")
+                self.status.setStyleSheet("color: #f472b6;")
+            elif self.silent_ticks == 0 and "Сигнала нет" in self.status.text():
+                self.refresh()
 
     def route_windows(self, on):
         """Весь звук Windows -> CABLE Input, при выключении — обратно."""
@@ -491,7 +680,7 @@ class Main(QMainWindow):
                 winaudio.set_default_output(self.saved_default)
                 self.saved_default = None
             elif winaudio.get_default_output() == winaudio.find_output("CABLE Input"):
-                back = winaudio.find_output(self.cout.currentText().split(" (")[-1].rstrip(")"))                     or winaudio.find_output("VXE V1")
+                back = winaudio.find_output("VXE V1")
                 if back:
                     winaudio.set_default_output(back)
         except Exception as ex:  # noqa: BLE001
@@ -512,8 +701,14 @@ class Main(QMainWindow):
         self.b8d.setChecked(e.mode_8d)
         self.bauto.setChecked(e.auto)
         self.bhand.setChecked(not e.auto)
+        self.bsys.setChecked(e.source == "system")
+        self.bfile.setChecked(e.source == "file")
+        self.cin.setVisible(e.source == "system")
+        self.cin_lbl.setVisible(e.source == "system")
         self.pattern.setEnabled(e.auto)
         self.s_speed.setEnabled(e.auto)
+        if e.track_name:
+            self.track_lbl.setText(e.track_name)
         self.power.setText("■  ВЫКЛЮЧИТЬ" if e.running else "▶  ВКЛЮЧИТЬ")
         self.power.setProperty("on", "true" if e.running else "false")
         self.power.style().unpolish(self.power)
@@ -522,10 +717,11 @@ class Main(QMainWindow):
             self.status.setText("⚠  " + e.error)
             self.status.setStyleSheet("color: #f472b6;")
         elif e.running:
-            self.status.setText(f"● В эфире — режим {'8D' if e.mode_8d else '2D'}")
+            src = "весь звук ПК" if e.source == "system" else "файл"
+            self.status.setText(f"● В эфире — {'8D' if e.mode_8d else '2D'} · {src}")
             self.status.setStyleSheet("color: #c084fc;")
         else:
-            self.status.setText("Выключено. Жми «Включить» — весь звук компа пойдёт через 8D.")
+            self.status.setText("Выключено. «Включить» — весь звук ПК в 8D, или открой файл / «Тест 8D».")
             self.status.setStyleSheet("")
 
 

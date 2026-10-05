@@ -224,6 +224,14 @@ class Engine:
         self.phase = 0.0
         self.mix = 1.0
         self.level = 0.0
+        self.in_level = 0.0
+        self.source = "system"  # system | file
+        self.track = None       # np.ndarray (N, 2) на частоте вывода
+        self.track_name = ""
+        self.track_pos = 0
+        self.track_sr = 48000
+        self.playing = False
+        self.loop = True
         self.scope = np.zeros(2048, np.float32)
         self.running = False
         self.error = ""
@@ -283,6 +291,7 @@ class Engine:
 
             def in_cb(indata, frames, t, status):
                 block = indata if ch_in == 2 else np.repeat(indata, 2, axis=1)
+                self.in_level = self.in_level * 0.8 + 0.2 * float(np.sqrt(np.mean(block ** 2)))
                 out = self.process(block.astype(np.float32), sr_in)
                 if self.resampler:
                     out = self.resampler.process(out)
@@ -299,6 +308,51 @@ class Engine:
                                         blocksize=self.BLOCK, dtype="float32", latency="low", callback=out_cb)
             self._out.start()
             self._in.start()
+            self.running = True
+        except Exception as e:  # noqa: BLE001
+            self.error = str(e)
+            self.stop()
+        return self.running
+
+    def load_track(self, data, sr, name):
+        """data: (N, ch) float32. Переводим в стерео на частоте 48 кГц."""
+        if data.ndim == 1:
+            data = data[:, None]
+        data = data[:, :2] if data.shape[1] >= 2 else np.repeat(data, 2, axis=1)
+        if sr != 48000:
+            from math import gcd
+            from scipy.signal import resample_poly
+            g = gcd(int(sr), 48000)
+            data = resample_poly(data, 48000 // g, int(sr) // g, axis=0)
+        self.track = np.ascontiguousarray(data, dtype=np.float32)
+        self.track_name = name
+        self.track_pos = 0
+        self.track_sr = 48000
+
+    def start_file(self, out_dev):
+        self.stop()
+        self.error = ""
+        try:
+            sr = self.track_sr
+            self.spat = Spatializer(sr)
+
+            def out_cb(outdata, frames, t, status):
+                block = np.zeros((frames, 2), np.float32)
+                tr = self.track
+                if self.playing and tr is not None:
+                    k = min(frames, len(tr) - self.track_pos)
+                    block[:k] = tr[self.track_pos:self.track_pos + k]
+                    self.track_pos += k
+                    if self.track_pos >= len(tr):
+                        self.track_pos = 0
+                        if not self.loop:
+                            self.playing = False
+                self.in_level = self.in_level * 0.8 + 0.2 * float(np.sqrt(np.mean(block ** 2)))
+                outdata[:] = self.process(block, sr)
+
+            self._out = sd.OutputStream(device=out_dev, channels=2, samplerate=sr,
+                                        blocksize=self.BLOCK, dtype="float32", latency="low", callback=out_cb)
+            self._out.start()
             self.running = True
         except Exception as e:  # noqa: BLE001
             self.error = str(e)
@@ -330,3 +384,31 @@ class Engine:
         self.scope = np.concatenate((self.scope[n:], mono))
         self.level = self.level * 0.8 + 0.2 * float(np.sqrt(np.mean(mono ** 2)))
         return out.astype(np.float32)
+
+
+def demo_track(sr=48000, seconds=16):
+    """Синтезированный луп для проверки 8D: бочка, хэт, арпеджио, бас."""
+    t = np.arange(int(sr * seconds)) / sr
+    out = np.zeros_like(t)
+    bpm = 110
+    beat = 60 / bpm
+    notes = [57, 60, 64, 69, 67, 64, 60, 64]
+    bass = [45, 45, 41, 43]
+    step = beat / 2
+    for i in range(int(seconds / step)):
+        st = int(i * step * sr)
+        seg = t[: int(step * sr)]
+        f = 440 * 2 ** ((notes[i % 8] - 69) / 12)
+        tone = (np.sin(2 * np.pi * f * seg) + 0.3 * np.sin(4 * np.pi * f * seg)) * np.exp(-seg * 5)
+        out[st:st + len(seg)] += 0.22 * tone[: len(out) - st]
+        hat = np.random.randn(len(seg)) * np.exp(-seg * 60) * 0.06
+        out[st:st + len(seg)] += hat[: len(out) - st]
+    for i in range(int(seconds / beat)):
+        st = int(i * beat * sr)
+        seg = t[: int(beat * sr)]
+        kick = np.sin(2 * np.pi * (50 + 90 * np.exp(-seg * 30)) * seg) * np.exp(-seg * 9) * 0.5
+        fb = 440 * 2 ** ((bass[(i // 4) % 4] - 69) / 12)
+        b = np.sin(2 * np.pi * fb * seg) * 0.18 * (1 - np.exp(-seg * 80))
+        out[st:st + len(seg)] += (kick + b)[: len(out) - st]
+    out /= np.abs(out).max() * 1.4
+    return np.stack([out, out], axis=1).astype(np.float32)
