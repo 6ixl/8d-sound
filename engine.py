@@ -406,7 +406,7 @@ class Engine:
             self._init_split(sr_in)
             self.equalizer = Equalizer(sr_in)
             self.resampler = Resampler(sr_in, sr_out) if sr_in != sr_out else None
-            self.fifo = Fifo(sr_out * 2, int(sr_out * self.buffer_ms / 1000))
+            self.fifo = Fifo(sr_out * 4, int(sr_out * self.buffer_ms / 1000))
             self.sr = sr_in
 
             def in_cb(indata, frames, t, status):
@@ -478,7 +478,8 @@ class Engine:
                 outdata[:] = self.process(block, sr)
 
             self._out = sd.OutputStream(device=out_dev, channels=2, samplerate=sr,
-                                        blocksize=self.block(), dtype="float32", latency="high", callback=out_cb)
+                                        blocksize=self.block(), dtype="float32",
+                                        latency=max(0.1, self.buffer_ms / 1000), callback=out_cb)
             self._out.start()
             self.running = True
         except Exception as e:  # noqa: BLE001
