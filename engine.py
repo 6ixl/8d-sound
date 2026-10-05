@@ -84,14 +84,26 @@ class Spatializer:
         self.rb, self.ra = one_pole(4500, sr)  # звук сзади
         self.rzi = [np.zeros(1), np.zeros(1)]
         self.reverb = Reverb(sr)
+        self.eb, self.ea = one_pole(5000, sr)  # высота: «ушная раковина»
+        self.ezi = np.zeros(1)
+        self.prev_elev = 0.0
 
-    def process(self, block, theta, dist, room):
+    def process(self, block, theta, dist, room, elev=0.0):
         n = len(block)
         mono = block.mean(axis=1).astype(np.float32)
 
         lo, self.xzi[0] = lfilter(self.xb, self.xa, mono, zi=self.xzi[0])
         lo, self.xzi[1] = lfilter(self.xb, self.xa, lo, zi=self.xzi[1])
         hi = mono - lo
+
+        # высота: сверху — ярче, снизу — глуше
+        ev = self.prev_elev + (elev - self.prev_elev) * np.arange(1, n + 1, dtype=np.float32) / n
+        self.prev_elev = elev
+        dull, self.ezi = lfilter(self.eb, self.ea, hi, zi=self.ezi)
+        air = hi - dull
+        hi = hi + air * (0.9 * np.maximum(ev, 0)) - air * (0.75 * np.maximum(-ev, 0))
+        hi = hi * (1.0 - 0.18 * np.maximum(-ev, 0))
+        narrow = np.cos(ev * math.pi / 2 * 0.75)  # над/под головой звук менее «боковой»
 
         # плавная интерполяция позиции по сэмплам
         dth = (theta - self.prev_theta + math.pi) % (2 * math.pi) - math.pi
@@ -101,7 +113,7 @@ class Spatializer:
         self.prev_theta = (self.prev_theta + dth) % (2 * math.pi)
         self.prev_dist = dist
 
-        p = np.sin(th) * np.clip(d * 1.6, 0.0, 1.0)  # у самой головы — ближе к центру
+        p = np.sin(th) * np.clip(d * 1.6, 0.0, 1.0) * narrow  # у самой головы — ближе к центру
         f = np.cos(th)
 
         # ITD: дальнее ухо слышит позже
@@ -150,35 +162,47 @@ class Spatializer:
 
 
 class Fifo:
-    def __init__(self, cap):
+    """Буфер между вводом и выводом: копит запас, не рвёт звук при дрейфе часов."""
+
+    def __init__(self, cap, target):
         self.buf = np.zeros((cap, 2), np.float32)
         self.n = 0
+        self.target = target
+        self.primed = False
+        self.underruns = 0
         self.lock = threading.Lock()
 
     def push(self, x):
         with self.lock:
             cap = len(self.buf)
-            if len(x) >= cap:
-                self.buf[:] = x[-cap:]
-                self.n = cap
-                return
             if self.n + len(x) > cap:
                 drop = self.n + len(x) - cap
                 self.buf[:self.n - drop] = self.buf[drop:self.n]
                 self.n -= drop
-            self.buf[self.n:self.n + len(x)] = x
-            self.n += len(x)
+            self.buf[self.n:self.n + len(x)] = x[-cap:]
+            self.n += len(x[-cap:])
 
-    def pop(self, count, max_latency):
+    def pop(self, count):
         with self.lock:
-            if self.n > max_latency:  # не даём задержке расти
-                drop = self.n - max_latency // 2
-                self.buf[:self.n - drop] = self.buf[drop:self.n]
-                self.n -= drop
-            k = min(self.n, count)
+            if not self.primed:
+                if self.n < self.target + count:
+                    return np.zeros((0, 2), np.float32)
+                self.primed = True
+            if self.n > self.target * 3:  # вход спешит — плавно выкидываем пару сэмплов
+                skip = min(self.n - self.target * 2, 16)
+                self.buf[:self.n - skip] = self.buf[skip:self.n]
+                self.n -= skip
+            if self.n < count:  # не хватило — копим заново, вместо рваного звука
+                self.primed = False
+                self.underruns += 1
+                k = self.n
+            else:
+                k = count
             out = self.buf[:k].copy()
             self.buf[:self.n - k] = self.buf[k:self.n]
             self.n -= k
+            if k < count and k > 0:  # плавное затухание в конце куска
+                out *= np.linspace(1, 0, k, dtype=np.float32)[:, None]
             return out
 
 
@@ -206,10 +230,61 @@ class Resampler:
 
 
 PATTERNS = ["Круг", "Восьмёрка", "Маятник", "Спираль"]
+EQ_FREQS = [60, 250, 1000, 4000, 12000]
+
+
+def _peaking(f, gain_db, sr, q=1.0):
+    a = 10 ** (gain_db / 40)
+    w = 2 * math.pi * f / sr
+    alpha = math.sin(w) / (2 * q)
+    c = math.cos(w)
+    b = [1 + alpha * a, -2 * c, 1 - alpha * a]
+    den = [1 + alpha / a, -2 * c, 1 - alpha / a]
+    return [x / den[0] for x in b] + [1.0] + [x / den[0] for x in den[1:]]
+
+
+def _low_shelf(f, gain_db, sr):
+    a = 10 ** (gain_db / 40)
+    w = 2 * math.pi * f / sr
+    c, sn = math.cos(w), math.sin(w)
+    alpha = sn / 2 * math.sqrt(2)
+    sa = 2 * math.sqrt(a) * alpha
+    b = [a * ((a + 1) - (a - 1) * c + sa), 2 * a * ((a - 1) - (a + 1) * c), a * ((a + 1) - (a - 1) * c - sa)]
+    den = [(a + 1) + (a - 1) * c + sa, -2 * ((a - 1) + (a + 1) * c), (a + 1) + (a - 1) * c - sa]
+    return [x / den[0] for x in b] + [1.0] + [x / den[0] for x in den[1:]]
+
+
+class Equalizer:
+    """5 полос + бас-буст (low shelf 90 Гц)."""
+
+    def __init__(self, sr):
+        self.sr = sr
+        self.key = None
+        self.sos = None
+        self.zi = None
+
+    def process(self, x, gains, bass):
+        from scipy.signal import sosfilt
+        key = (tuple(round(g, 1) for g in gains), round(bass, 1))
+        if all(g == 0 for g in key[0]) and key[1] == 0:
+            self.key = None
+            return x
+        if key != self.key:
+            sos = [_peaking(f, g, self.sr) for f, g in zip(EQ_FREQS, key[0]) if g]
+            if key[1]:
+                sos.append(_low_shelf(90, key[1], self.sr))
+            sos = np.array(sos)
+            if self.zi is None or self.zi.shape[0] != len(sos):
+                self.zi = np.zeros((len(sos), 2, 2))
+            self.sos, self.key = sos, key
+        y, self.zi = sosfilt(self.sos, x, axis=0, zi=self.zi)
+        # чтобы буст не перегружал: мягкая компенсация
+        boost = max([0.0] + list(key[0]) + [key[1]])
+        return (y * 10 ** (-boost * 0.6 / 20)).astype(np.float32)
 
 
 class Engine:
-    BLOCK = 256
+    BLOCK = 1024
 
     def __init__(self):
         self.mode_8d = True
@@ -219,6 +294,13 @@ class Engine:
         self.distance = 0.75   # 0..1
         self.room = 0.25       # 0..1
         self.volume = 0.9
+        self.elevation = 0.0   # -1 (снизу) .. 1 (сверху)
+        self.elev_wobble = 0.0  # 0..1 качание по высоте в авто-режиме
+        self.eq = [0.0] * 5    # дБ
+        self.bass = 0.0        # дБ
+        self.buffer_ms = 50    # запас буфера
+        self.rate = 1.0        # скорость трека (slowed)
+        self.pos_z = 0.0
         self.manual_xy = (0.0, 0.75)  # x вправо, y вперёд
         self.pos_xy = (0.0, 0.75)
         self.phase = 0.0
@@ -228,7 +310,7 @@ class Engine:
         self.source = "system"  # system | file
         self.track = None       # np.ndarray (N, 2) на частоте вывода
         self.track_name = ""
-        self.track_pos = 0
+        self.track_pos = 0.0
         self.track_sr = 48000
         self.playing = False
         self.loop = True
@@ -236,6 +318,9 @@ class Engine:
         self.running = False
         self.error = ""
         self._in = self._out = None
+
+    def block(self):
+        return 256 if self.buffer_ms <= 25 else 512 if self.buffer_ms <= 60 else 1024
 
     # ---------- устройства ----------
     @staticmethod
@@ -270,10 +355,15 @@ class Engine:
             else:
                 rr = r * (0.35 + 0.65 * (0.5 + 0.5 * math.sin(a * 0.25)))
                 x, y = math.sin(a * 2) * rr, math.cos(a * 2) * rr
+        z = self.elevation
+        if self.auto and self.elev_wobble:
+            z += self.elev_wobble * math.sin(2 * math.pi * self.phase * 3)
+        z = max(-1.0, min(1.0, z))
         self.pos_xy = (x, y)
+        self.pos_z = z
         dist = min(1.0, math.hypot(x, y))
         theta = math.atan2(x, y)
-        return theta, dist
+        return theta, dist, z
 
     # ---------- поток ----------
     def start(self, in_dev, out_dev):
@@ -284,9 +374,9 @@ class Engine:
             sr_in, sr_out = int(din["default_samplerate"]), int(dout["default_samplerate"])
             ch_in = min(2, din["max_input_channels"])
             self.spat = Spatializer(sr_in)
+            self.equalizer = Equalizer(sr_in)
             self.resampler = Resampler(sr_in, sr_out) if sr_in != sr_out else None
-            self.fifo = Fifo(sr_out)
-            self.max_latency = int(sr_out * 0.06)
+            self.fifo = Fifo(sr_out * 2, int(sr_out * self.buffer_ms / 1000))
             self.sr = sr_in
 
             def in_cb(indata, frames, t, status):
@@ -298,14 +388,14 @@ class Engine:
                 self.fifo.push(out)
 
             def out_cb(outdata, frames, t, status):
-                data = self.fifo.pop(frames, self.max_latency)
+                data = self.fifo.pop(frames)
                 outdata[:len(data)] = data
                 outdata[len(data):] = 0
 
             self._in = sd.InputStream(device=in_dev, channels=ch_in, samplerate=sr_in,
-                                      blocksize=self.BLOCK, dtype="float32", latency="low", callback=in_cb)
+                                      blocksize=self.block(), dtype="float32", latency="high", callback=in_cb)
             self._out = sd.OutputStream(device=out_dev, channels=2, samplerate=sr_out,
-                                        blocksize=self.BLOCK, dtype="float32", latency="low", callback=out_cb)
+                                        blocksize=self.block(), dtype="float32", latency="high", callback=out_cb)
             self._out.start()
             self._in.start()
             self.running = True
@@ -335,23 +425,29 @@ class Engine:
         try:
             sr = self.track_sr
             self.spat = Spatializer(sr)
+            self.equalizer = Equalizer(sr)
 
             def out_cb(outdata, frames, t, status):
                 block = np.zeros((frames, 2), np.float32)
                 tr = self.track
                 if self.playing and tr is not None:
-                    k = min(frames, len(tr) - self.track_pos)
-                    block[:k] = tr[self.track_pos:self.track_pos + k]
-                    self.track_pos += k
-                    if self.track_pos >= len(tr):
-                        self.track_pos = 0
+                    # slowed: читаем медленнее с интерполяцией (тон тоже ниже — как в slowed-треках)
+                    pos = self.track_pos + self.rate * np.arange(frames)
+                    valid = pos < len(tr) - 1
+                    pv = pos[valid]
+                    i0 = pv.astype(np.int64)
+                    fr = (pv - i0)[:, None].astype(np.float32)
+                    block[:len(pv)] = tr[i0] * (1 - fr) + tr[i0 + 1] * fr
+                    self.track_pos += self.rate * frames
+                    if self.track_pos >= len(tr) - 1:
+                        self.track_pos = 0.0
                         if not self.loop:
                             self.playing = False
                 self.in_level = self.in_level * 0.8 + 0.2 * float(np.sqrt(np.mean(block ** 2)))
                 outdata[:] = self.process(block, sr)
 
             self._out = sd.OutputStream(device=out_dev, channels=2, samplerate=sr,
-                                        blocksize=self.BLOCK, dtype="float32", latency="low", callback=out_cb)
+                                        blocksize=self.block(), dtype="float32", latency="high", callback=out_cb)
             self._out.start()
             self.running = True
         except Exception as e:  # noqa: BLE001
@@ -372,12 +468,13 @@ class Engine:
 
     def process(self, block, sr):
         n = len(block)
-        theta, dist = self._advance(n, sr)
-        wet = self.spat.process(block, theta, dist, self.room * 0.9)
+        theta, dist, elev = self._advance(n, sr)
+        wet = self.spat.process(block, theta, dist, self.room * 0.9, elev)
         target = 1.0 if self.mode_8d else 0.0
         ramp = np.linspace(self.mix, target, n, dtype=np.float32)[:, None]
         self.mix = target
         out = (wet * ramp + block * (1 - ramp)) * self.volume
+        out = self.equalizer.process(out, self.eq, self.bass)
         a = np.abs(out)
         out = np.where(a < 0.85, out, np.sign(out) * (0.85 + 0.15 * np.tanh((a - 0.85) / 0.15)))
         mono = out.mean(axis=1)

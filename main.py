@@ -1,4 +1,5 @@
 """8D Sound — превращает любой звук Windows в 8D."""
+import json
 import math
 import os
 import sys
@@ -7,11 +8,13 @@ import numpy as np
 from PySide6.QtCore import QPointF, QRectF, QSettings, Qt, QTimer, Signal
 from PySide6.QtGui import (QBrush, QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath,
                            QPen, QPixmap, QRadialGradient)
-from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout, QLabel, QMainWindow,
-                               QPushButton, QSlider, QVBoxLayout, QWidget, QFileDialog)
+from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
+                               QInputDialog, QLabel, QMainWindow, QMenu, QPushButton, QSlider,
+                               QSystemTrayIcon, QTabWidget, QVBoxLayout, QWidget)
 
 from engine import PATTERNS, Engine, demo_track
 import winaudio
+from icon import app_icon, render
 
 VIOLET = QColor("#a855f7")
 VIOLET_LIGHT = QColor("#d8b4fe")
@@ -49,6 +52,32 @@ QSlider::sub-page:horizontal { background: qlineargradient(x1:0, y1:0, x2:1, y2:
 QSlider::handle:horizontal { background: #f5d0fe; width: 16px; height: 16px; margin: -5px 0; border-radius: 8px;
                              border: 2px solid #a855f7; }
 QSlider::handle:horizontal:hover { background: #ffffff; }
+QSlider::groove:vertical { width: 6px; background: rgba(168, 85, 247, 0.18); border-radius: 3px; }
+QSlider::add-page:vertical { background: qlineargradient(x1:0, y1:1, x2:0, y2:0, stop:0 #7c3aed, stop:1 #e879f9);
+                             border-radius: 3px; }
+QSlider::handle:vertical { background: #f5d0fe; width: 16px; height: 16px; margin: 0 -5px; border-radius: 8px;
+                           border: 2px solid #a855f7; }
+QSlider:disabled { opacity: 0.4; }
+QSlider::sub-page:horizontal:disabled { background: rgba(168, 85, 247, 0.3); }
+QTabWidget::pane { background: rgba(40, 18, 70, 0.55); border: 1px solid rgba(168, 85, 247, 0.25);
+                   border-radius: 18px; top: -1px; }
+QTabBar::tab { background: transparent; color: #9d7cc9; padding: 8px 16px; margin-right: 4px;
+               border-top-left-radius: 10px; border-top-right-radius: 10px; font-weight: 700; }
+QTabBar::tab:selected { background: rgba(124, 58, 237, 0.45); color: #f3e8ff; }
+QTabBar::tab:hover { color: #f3e8ff; }
+QCheckBox { spacing: 8px; }
+QCheckBox::indicator { width: 18px; height: 18px; border-radius: 6px; border: 1px solid #a855f7;
+                       background: rgba(30, 12, 55, 0.9); }
+QCheckBox::indicator:checked { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #7c3aed, stop:1 #c026d3); }
+QToolTip { background: #1a0b30; color: #f3e8ff; border: 1px solid #7c3aed; }
+QInputDialog, QMessageBox { background: #120822; }
+QLineEdit { background: rgba(30, 12, 55, 0.9); border: 1px solid #7c3aed; border-radius: 8px; padding: 6px; }
+"""
+MENU_STYLE = """
+QMenu { background: #1a0b30; color: #f3e8ff; border: 1px solid #7c3aed; border-radius: 8px; padding: 6px; }
+QMenu::item { padding: 6px 22px; border-radius: 6px; }
+QMenu::item:selected { background: #7c3aed; }
+QMenu::separator { height: 1px; background: rgba(168, 85, 247, 0.35); margin: 4px 8px; }
 """
 
 
@@ -56,6 +85,7 @@ class SpacePad(QWidget):
     """Круг вокруг головы слушателя: показывает и задаёт положение звука."""
 
     moved = Signal(float, float)
+    height = Signal(int)
 
     def __init__(self, engine):
         super().__init__()
@@ -72,9 +102,9 @@ class SpacePad(QWidget):
         return c, side / 2
 
     def tick(self):
-        self.t += 1 / 60
+        self.t += 1 / 30
         if not self.engine.running:  # без звука двигаем точку сами
-            self.engine._advance(1, 60)
+            self.engine._advance(1, 30)
         sc = self.engine.scope
         if self.engine.running:
             spec = np.abs(np.fft.rfft(sc * np.hanning(len(sc))))[1:400]
@@ -106,6 +136,10 @@ class SpacePad(QWidget):
             self.moved.emit(*self._to_xy(e.position()))
 
     def wheelEvent(self, e):
+        if e.modifiers() & Qt.ShiftModifier:
+            d = e.angleDelta().y() or e.angleDelta().x()
+            self.height.emit(10 if d > 0 else -10)
+            return
         x, y = self.engine.pos_xy
         r = max(0.15, math.hypot(x, y))
         a = math.atan2(x, y) + math.radians(e.angleDelta().y() / 120 * 10)
@@ -195,9 +229,15 @@ class SpacePad(QWidget):
             glow.setColorAt(1, QColor(124, 58, 237, 0))
             p.setBrush(glow)
             p.drawEllipse(s, 34 + 20 * lvl, 34 + 20 * lvl)
+            z = self.engine.pos_z if self.engine.mode_8d else 0.0
+            rad = 9 * (1 + 0.45 * z)
             p.setBrush(QColor("#fdf4ff"))
             p.setPen(QPen(PINK, 3))
-            p.drawEllipse(s, 9, 9)
+            p.drawEllipse(s, rad, rad)
+            if abs(z) > 0.04:
+                p.setPen(QColor("#f5d0fe"))
+                p.setFont(QFont("Segoe UI", 9, QFont.Bold))
+                p.drawText(QPointF(s.x() + 16, s.y() - 12), f"{'↑' if z > 0 else '↓'} {abs(z) * 100:.0f}%")
 
 
 class Meter(QWidget):
@@ -260,32 +300,61 @@ def card():
     return f, lay
 
 
-def make_icon():
-    pm = QPixmap(128, 128)
-    pm.fill(Qt.transparent)
-    p = QPainter(pm)
-    p.setRenderHint(QPainter.Antialiasing)
-    g = QLinearGradient(0, 0, 128, 128)
-    g.setColorAt(0, QColor("#7c3aed"))
-    g.setColorAt(1, QColor("#c026d3"))
-    p.setBrush(g)
-    p.setPen(Qt.NoPen)
-    p.drawRoundedRect(4, 4, 120, 120, 30, 30)
-    p.setPen(QColor("white"))
-    p.setFont(QFont("Segoe UI", 44, QFont.Black))
-    p.drawText(QRectF(0, 0, 128, 128), Qt.AlignCenter, "8D")
-    p.end()
-    return QIcon(pm)
+PRESETS = {
+    "Классика 8D": dict(pattern=0, speed=12, dist=75, room=25, elev=0, wobble=0, eq=[0, 0, 0, 0, 0], bass=0, rate=100),
+    "Концертный зал": dict(pattern=0, speed=6, dist=95, room=80, elev=10, wobble=10, eq=[1, 0, 0, 1, 2], bass=2, rate=100),
+    "Шёпот у уха": dict(pattern=2, speed=20, dist=22, room=5, elev=0, wobble=0, eq=[0, 0, 2, 4, 3], bass=0, rate=100),
+    "Под водой": dict(pattern=0, speed=5, dist=60, room=45, elev=-20, wobble=15, eq=[4, 2, -6, -14, -18], bass=4, rate=100),
+    "Космос": dict(pattern=3, speed=8, dist=100, room=100, elev=20, wobble=60, eq=[0, 0, 0, 2, 4], bass=2, rate=100),
+    "Slowed + reverb": dict(pattern=0, speed=8, dist=70, room=70, elev=0, wobble=0, eq=[2, 1, 0, -1, -2], bass=3, rate=82),
+    "Бас-качалка": dict(pattern=1, speed=15, dist=65, room=20, elev=0, wobble=20, eq=[6, 2, 0, 1, 2], bass=8, rate=100),
+}
+
+BUFFERS = [(20, "20 мс — минимум задержки"), (50, "50 мс — баланс"), (100, "100 мс — стабильно"),
+           (200, "200 мс — очень стабильно"), (300, "300 мс — максимум")]
+
+RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def autostart_command():
+    if getattr(sys, "frozen", False):
+        return f'"{sys.executable}" --tray'
+    pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+    return f'"{pyw}" "{os.path.abspath(__file__)}" --tray'
+
+
+def autostart_enabled():
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY) as k:
+            winreg.QueryValueEx(k, "8D Sound")
+            return True
+    except OSError:
+        return False
+
+
+def set_autostart(on):
+    import winreg
+    with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY, 0, winreg.KEY_SET_VALUE) as k:
+        if on:
+            winreg.SetValueEx(k, "8D Sound", 0, winreg.REG_SZ, autostart_command())
+        else:
+            try:
+                winreg.DeleteValue(k, "8D Sound")
+            except OSError:
+                pass
 
 
 class Main(QMainWindow):
-    def __init__(self):
+    def __init__(self, tray_start=False):
         super().__init__()
         self.engine = Engine()
         self.settings = QSettings("6ixl", "8D Sound")
+        self.quitting = False
+        self.silent_ticks = 0
         self.setWindowTitle("8D Sound")
-        self.setWindowIcon(make_icon())
-        self.resize(1060, 700)
+        self.setWindowIcon(app_icon())
+        self.resize(1120, 780)
 
         root = QWidget()
         root.setObjectName("root")
@@ -294,18 +363,26 @@ class Main(QMainWindow):
         main.setContentsMargins(22, 20, 22, 20)
         main.setSpacing(20)
 
-        # ---- левая колонка: площадка ----
+        # ---- левая колонка: площадка и плеер ----
         left = QVBoxLayout()
+        head = QHBoxLayout()
+        logo = QLabel()
+        logo.setPixmap(render(44))
         title = QLabel("8D SOUND")
         title.setObjectName("title")
+        head.addWidget(logo)
+        head.addWidget(title)
+        head.addStretch()
+        left.addLayout(head)
         self.status = QLabel()
         self.status.setObjectName("subtitle")
-        left.addWidget(title)
+        self.status.setWordWrap(True)
         left.addWidget(self.status)
         self.pad = SpacePad(self.engine)
         self.pad.moved.connect(self.on_pad)
+        self.pad.height.connect(self.on_pad_height)
         left.addWidget(self.pad, 1)
-        hint = QLabel("Тащи точку мышкой или крути колёсиком. Центр = в голове, край = далеко.")
+        hint = QLabel("Тащи точку мышкой · колёсико — вращать · Shift + колёсико — высота")
         hint.setObjectName("hint")
         hint.setAlignment(Qt.AlignCenter)
         left.addWidget(hint)
@@ -327,13 +404,12 @@ class Main(QMainWindow):
         info.addWidget(self.time_lbl)
         top.addLayout(info, 1)
         bopen = QPushButton("📂  Открыть")
-        bopen.setCursor(Qt.PointingHandCursor)
         bopen.clicked.connect(self.open_file)
         btest = QPushButton("🎧  Тест 8D")
-        btest.setCursor(Qt.PointingHandCursor)
         btest.clicked.connect(self.play_demo)
-        top.addWidget(bopen)
-        top.addWidget(btest)
+        for b in (bopen, btest):
+            b.setCursor(Qt.PointingHandCursor)
+            top.addWidget(b)
         pl.addLayout(top)
         self.seek = QSlider(Qt.Horizontal)
         self.seek.setRange(0, 1000)
@@ -345,12 +421,9 @@ class Main(QMainWindow):
 
         # ---- правая колонка ----
         right = QVBoxLayout()
-        right.setSpacing(14)
+        right.setSpacing(12)
 
         c1, l1 = card()
-        sec = QLabel("РЕЖИМ")
-        sec.setObjectName("section")
-        l1.addWidget(sec)
         seg = QHBoxLayout()
         self.b2d = QPushButton("2D")
         self.b8d = QPushButton("8D")
@@ -362,14 +435,31 @@ class Main(QMainWindow):
         self.b2d.clicked.connect(lambda: self.set_mode(False))
         self.b8d.clicked.connect(lambda: self.set_mode(True))
         l1.addLayout(seg)
+        prow = QHBoxLayout()
+        self.preset = QComboBox()
+        self.preset.activated.connect(lambda _: self.apply_preset(self.preset.currentText()))
+        bsave = QPushButton("💾")
+        bsave.setToolTip("Сохранить текущие настройки как свой пресет")
+        bsave.clicked.connect(self.save_preset)
+        bdel = QPushButton("🗑")
+        bdel.setToolTip("Удалить свой пресет")
+        bdel.clicked.connect(self.delete_preset)
+        for b in (bsave, bdel):
+            b.setFixedWidth(46)
+            b.setCursor(Qt.PointingHandCursor)
+        prow.addWidget(self.preset, 1)
+        prow.addWidget(bsave)
+        prow.addWidget(bdel)
+        l1.addLayout(prow)
         right.addWidget(c1)
 
-        c2, l2 = card()
-        sec = QLabel("ДВИЖЕНИЕ")
-        sec.setObjectName("section")
-        l2.addWidget(sec)
+        self.tabs = QTabWidget()
+        right.addWidget(self.tabs, 1)
+
+        # вкладка «Движение»
+        t1, m1 = self.tab("Движение")
         mv = QHBoxLayout()
-        self.bauto = QPushButton("⟳  Авто-вращение")
+        self.bauto = QPushButton("⟳  Авто")
         self.bhand = QPushButton("✋  Вручную")
         for b in (self.bauto, self.bhand):
             b.setCheckable(True)
@@ -377,29 +467,64 @@ class Main(QMainWindow):
             mv.addWidget(b)
         self.bauto.clicked.connect(lambda: self.set_auto(True))
         self.bhand.clicked.connect(lambda: self.set_auto(False))
-        l2.addLayout(mv)
+        m1.addLayout(mv)
         self.pattern = QComboBox()
         self.pattern.addItems(PATTERNS)
         self.pattern.currentIndexChanged.connect(lambda i: setattr(self.engine, "pattern", i))
-        l2.addWidget(self.pattern)
-        box, self.s_speed = labeled_slider("Скорость", 2, 60, 12, lambda v: f"{100 / v:.1f} с/оборот")
-        self.s_speed.valueChanged.connect(lambda v: setattr(self.engine, "speed", v / 100))
-        l2.addLayout(box)
-        box, self.s_dist = labeled_slider("Дистанция", 15, 100, 75, lambda v: f"{v}%")
-        self.s_dist.valueChanged.connect(lambda v: setattr(self.engine, "distance", v / 100))
-        l2.addLayout(box)
-        box, self.s_room = labeled_slider("Пространство", 0, 100, 25, lambda v: f"{v}%")
-        self.s_room.valueChanged.connect(lambda v: setattr(self.engine, "room", v / 100))
-        l2.addLayout(box)
-        box, self.s_vol = labeled_slider("Громкость", 0, 150, 90, lambda v: f"{v}%")
-        self.s_vol.valueChanged.connect(lambda v: setattr(self.engine, "volume", v / 100))
-        l2.addLayout(box)
-        right.addWidget(c2)
+        m1.addWidget(self.pattern)
+        self.s_speed = self.slider(m1, "Скорость", 2, 60, 12, lambda v: f"{100 / v:.1f} с/оборот",
+                                   lambda v: setattr(self.engine, "speed", v / 100))
+        self.s_dist = self.slider(m1, "Дистанция", 15, 100, 75, lambda v: f"{v}%",
+                                  lambda v: setattr(self.engine, "distance", v / 100))
+        self.s_elev = self.slider(m1, "Высота", -100, 100, 0,
+                                  lambda v: "по уровню ушей" if v == 0 else (f"↑ {v}%" if v > 0 else f"↓ {-v}%"),
+                                  lambda v: setattr(self.engine, "elevation", v / 100))
+        self.s_wob = self.slider(m1, "Качание вверх-вниз", 0, 100, 0, lambda v: "выкл" if v == 0 else f"{v}%",
+                                 lambda v: setattr(self.engine, "elev_wobble", v / 100))
+        m1.addStretch()
 
-        c3, l3 = card()
-        sec = QLabel("ЗВУК")
+        # вкладка «Звук»
+        t2, m2 = self.tab("Звук")
+        self.s_room = self.slider(m2, "Пространство (реверб)", 0, 100, 25, lambda v: f"{v}%",
+                                  lambda v: setattr(self.engine, "room", v / 100))
+        self.s_vol = self.slider(m2, "Громкость", 0, 150, 90, lambda v: f"{v}%",
+                                 lambda v: setattr(self.engine, "volume", v / 100))
+        self.s_rate = self.slider(m2, "Slowed (только файл)", 60, 100, 100,
+                                  lambda v: "обычная скорость" if v == 100 else f"{v}% скорости",
+                                  lambda v: setattr(self.engine, "rate", v / 100))
+        sec = QLabel("ЭКВАЛАЙЗЕР")
         sec.setObjectName("section")
-        l3.addWidget(sec)
+        m2.addWidget(sec)
+        eqrow = QHBoxLayout()
+        self.eq_sliders = []
+        names = ["Бас+", "60", "250", "1k", "4k", "12k"]
+        for i, name in enumerate(names):
+            col = QVBoxLayout()
+            val = QLabel("0")
+            val.setObjectName("value")
+            val.setAlignment(Qt.AlignCenter)
+            s = QSlider(Qt.Vertical)
+            s.setRange(-12 if i else 0, 12)
+            s.setFixedHeight(110)
+            s.valueChanged.connect(lambda v, lb=val: lb.setText(f"{v:+d}" if v else "0"))
+            s.valueChanged.connect(self.eq_changed)
+            lb = QLabel(name)
+            lb.setObjectName("hint")
+            lb.setAlignment(Qt.AlignCenter)
+            col.addWidget(val)
+            col.addWidget(s, 0, Qt.AlignHCenter)
+            col.addWidget(lb)
+            eqrow.addLayout(col)
+            self.eq_sliders.append(s)
+        m2.addLayout(eqrow)
+        beq = QPushButton("Сбросить эквалайзер")
+        beq.setCursor(Qt.PointingHandCursor)
+        beq.clicked.connect(lambda: [s.setValue(0) for s in self.eq_sliders])
+        m2.addWidget(beq)
+        m2.addStretch()
+
+        # вкладка «Настройки»
+        t3, m3 = self.tab("Настройки")
         src = QHBoxLayout()
         self.bsys = QPushButton("🖥  Весь звук ПК")
         self.bfile = QPushButton("🎵  Файл")
@@ -409,39 +534,57 @@ class Main(QMainWindow):
             src.addWidget(b)
         self.bsys.clicked.connect(lambda: self.set_source("system"))
         self.bfile.clicked.connect(lambda: self.set_source("file"))
-        l3.addLayout(src)
+        m3.addLayout(src)
         self.cin = QComboBox()
         self.cout = QComboBox()
         self.cin_lbl = QLabel("Откуда брать (VB-Cable Output)")
         self.cin_lbl.setObjectName("hint")
-        l3.addWidget(self.cin_lbl)
-        l3.addWidget(self.cin)
+        m3.addWidget(self.cin_lbl)
+        m3.addWidget(self.cin)
         lab = QLabel("Куда выводить (твои наушники)")
         lab.setObjectName("hint")
-        l3.addWidget(lab)
-        l3.addWidget(self.cout)
+        m3.addWidget(lab)
+        m3.addWidget(self.cout)
+        lab = QLabel("Буфер (больше — стабильнее, меньше — без задержки)")
+        lab.setObjectName("hint")
+        m3.addWidget(lab)
+        self.buffer = QComboBox()
+        for ms, text in BUFFERS:
+            self.buffer.addItem(text, ms)
+        self.buffer.setCurrentIndex(1)
+        m3.addWidget(self.buffer)
         row = QHBoxLayout()
         win = QPushButton("⚙  Звук Windows")
-        win.setCursor(Qt.PointingHandCursor)
         win.clicked.connect(lambda: os.startfile("ms-settings:sound"))
         ref = QPushButton("↻")
-        ref.setFixedWidth(44)
-        ref.setCursor(Qt.PointingHandCursor)
+        ref.setFixedWidth(46)
+        ref.setToolTip("Обновить список устройств")
         ref.clicked.connect(self.load_devices)
+        for b in (win, ref):
+            b.setCursor(Qt.PointingHandCursor)
         row.addWidget(win, 1)
         row.addWidget(ref)
-        l3.addLayout(row)
-        for name, getter in (("Вход", lambda: self.engine.in_level), ("Выход 8D", lambda: self.engine.level)):
-            r = QHBoxLayout()
+        m3.addLayout(row)
+        self.cb_auto = QCheckBox("Запускать вместе с Windows (в трее)")
+        self.cb_auto.setChecked(autostart_enabled())
+        self.cb_auto.toggled.connect(self.toggle_autostart)
+        self.cb_tray = QCheckBox("Крестик сворачивает в трей")
+        self.cb_tray.setChecked(True)
+        m3.addWidget(self.cb_auto)
+        m3.addWidget(self.cb_tray)
+        m3.addStretch()
+
+        # индикаторы
+        self.meters = []
+        mbox = QHBoxLayout()
+        for name, getter in (("Вход", lambda: self.engine.in_level), ("Выход", lambda: self.engine.level)):
             lb = QLabel(name)
             lb.setObjectName("hint")
-            lb.setFixedWidth(62)
             m = Meter(getter)
-            self.meters = getattr(self, "meters", []) + [m]
-            r.addWidget(lb)
-            r.addWidget(m, 1)
-            l3.addLayout(r)
-        right.addWidget(c3)
+            self.meters.append(m)
+            mbox.addWidget(lb)
+            mbox.addWidget(m, 1)
+        right.addLayout(mbox)
 
         self.power = QPushButton()
         self.power.setObjectName("power")
@@ -452,21 +595,173 @@ class Main(QMainWindow):
         reset.setCursor(Qt.PointingHandCursor)
         reset.clicked.connect(self.reset)
         right.addWidget(reset)
-        right.addStretch()
         main.addLayout(right, 2)
 
         self.setStyleSheet(STYLE)
         self.load_devices()
         self.restore()
+        self.reload_presets()
         self.cin.currentIndexChanged.connect(self.devices_changed)
         self.cout.currentIndexChanged.connect(self.devices_changed)
+        self.buffer.currentIndexChanged.connect(self.buffer_changed)
+        self.buffer_changed()
 
+        self.make_tray()
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.tick)
-        self.timer.start(16)
+        self.timer.start(33)
         self.refresh()
+        if tray_start and self.settings.value("was_running", "false") == "true":
+            self.start()
+
+    # ---------- построение ----------
+    def tab(self, name):
+        w = QWidget()
+        lay = QVBoxLayout(w)
+        lay.setContentsMargins(16, 16, 16, 12)
+        lay.setSpacing(12)
+        self.tabs.addTab(w, name)
+        return w, lay
+
+    def slider(self, layout, title, lo, hi, val, fmt, on_change):
+        box, s = labeled_slider(title, lo, hi, val, fmt)
+        s.valueChanged.connect(on_change)
+        on_change(val)
+        layout.addLayout(box)
+        return s
+
+    def make_tray(self):
+        self.tray = QSystemTrayIcon(app_icon(False), self)
+        menu = QMenu()
+        menu.setStyleSheet(MENU_STYLE)
+        self.m_show = menu.addAction("Открыть 8D Sound", self.show_window)
+        menu.addSeparator()
+        self.m_power = menu.addAction("Включить", self.toggle)
+        self.m_mode = menu.addAction("Режим 8D", lambda: self.set_mode(not self.engine.mode_8d))
+        self.m_mode.setCheckable(True)
+        self.m_presets = menu.addMenu("Пресеты")
+        menu.addSeparator()
+        menu.addAction("Выход", self.quit_app)
+        self.tray_menu = menu
+        self.tray.setContextMenu(menu)
+        self.tray.activated.connect(
+            lambda r: self.show_window() if r in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick) else None)
+        self.tray.show()
+
+    # ---------- трей / окно ----------
+    def show_window(self):
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def quit_app(self):
+        self.quitting = True
+        self.close()
+
+    def closeEvent(self, e):
+        if self.cb_tray.isChecked() and not self.quitting:
+            e.ignore()
+            self.hide()
+            if not self.settings.value("tray_hint_shown"):
+                self.tray.showMessage("8D Sound", "Я свернулся в трей и продолжаю работать.", app_icon(), 3000)
+                self.settings.setValue("tray_hint_shown", True)
+            return
+        self.save_settings()
+        self.engine.stop()
+        self.route_windows(False)
+        self.tray.hide()
+        e.accept()
+        QApplication.quit()
+
+    def toggle_autostart(self, on):
+        try:
+            set_autostart(on)
+        except OSError as ex:
+            self.engine.error = f"Автозапуск: {ex}"
+            self.refresh()
+
+    # ---------- пресеты ----------
+    def custom_presets(self):
+        try:
+            return json.loads(self.settings.value("custom_presets", "{}"))
+        except (TypeError, ValueError):
+            return {}
+
+    def reload_presets(self):
+        cur = self.preset.currentText()
+        self.preset.clear()
+        self.preset.addItem("— Пресет —")
+        for name in PRESETS:
+            self.preset.addItem(name)
+        for name in self.custom_presets():
+            self.preset.addItem("★ " + name)
+        if cur and self.preset.findText(cur) >= 0:
+            self.preset.setCurrentText(cur)
+        self.m_presets_fill()
+
+    def m_presets_fill(self):
+        if not hasattr(self, "m_presets"):
+            return
+        self.m_presets.clear()
+        for i in range(1, self.preset.count()):
+            name = self.preset.itemText(i)
+            self.m_presets.addAction(name, lambda n=name: self.apply_preset(n))
+
+    def current_values(self):
+        return dict(pattern=self.pattern.currentIndex(), speed=self.s_speed.value(), dist=self.s_dist.value(),
+                    room=self.s_room.value(), elev=self.s_elev.value(), wobble=self.s_wob.value(),
+                    eq=[s.value() for s in self.eq_sliders[1:]], bass=self.eq_sliders[0].value(),
+                    rate=self.s_rate.value())
+
+    def apply_preset(self, name):
+        p = PRESETS.get(name) or self.custom_presets().get(name.removeprefix("★ "))
+        if not p:
+            return
+        self.pattern.setCurrentIndex(p["pattern"])
+        self.s_speed.setValue(p["speed"])
+        self.s_dist.setValue(p["dist"])
+        self.s_room.setValue(p["room"])
+        self.s_elev.setValue(p["elev"])
+        self.s_wob.setValue(p["wobble"])
+        self.eq_sliders[0].setValue(p["bass"])
+        for s, v in zip(self.eq_sliders[1:], p["eq"]):
+            s.setValue(v)
+        self.s_rate.setValue(p["rate"])
+        self.engine.mode_8d = True
+        self.set_auto(True)
+        self.preset.setCurrentText(name)
+
+    def save_preset(self):
+        name, ok = QInputDialog.getText(self, "Свой пресет", "Название:")
+        name = name.strip()
+        if ok and name:
+            data = self.custom_presets()
+            data[name] = self.current_values()
+            self.settings.setValue("custom_presets", json.dumps(data, ensure_ascii=False))
+            self.reload_presets()
+            self.preset.setCurrentText("★ " + name)
+
+    def delete_preset(self):
+        name = self.preset.currentText()
+        if not name.startswith("★ "):
+            self.status.setText("Удалять можно только свои пресеты (со ★).")
+            return
+        data = self.custom_presets()
+        data.pop(name[2:], None)
+        self.settings.setValue("custom_presets", json.dumps(data, ensure_ascii=False))
+        self.reload_presets()
+        self.preset.setCurrentIndex(0)
 
     # ---------- логика ----------
+    def eq_changed(self):
+        self.engine.bass = float(self.eq_sliders[0].value())
+        self.engine.eq = [float(s.value()) for s in self.eq_sliders[1:]]
+
+    def buffer_changed(self):
+        self.engine.buffer_ms = self.buffer.currentData()
+        if self.engine.running:
+            self.start()
+
     def load_devices(self):
         ins, outs, default_out = Engine.wasapi_devices()
         cur_in, cur_out = self.cin.currentText(), self.cout.currentText()
@@ -485,12 +780,22 @@ class Main(QMainWindow):
         if pick_out:
             self.cout.setCurrentText(pick_out)
 
+    SLIDERS = ("speed", "dist", "room", "vol", "elev", "wob", "rate")
+
+    def slider_map(self):
+        return dict(zip(self.SLIDERS, (self.s_speed, self.s_dist, self.s_room, self.s_vol, self.s_elev,
+                                       self.s_wob, self.s_rate)))
+
     def restore(self):
         s = self.settings
-        for key, w in (("speed", self.s_speed), ("dist", self.s_dist), ("room", self.s_room), ("vol", self.s_vol)):
+        for key, w in self.slider_map().items():
             if s.contains(key):
                 w.setValue(int(s.value(key)))
+        for i, sl in enumerate(self.eq_sliders):
+            if s.contains(f"eq{i}"):
+                sl.setValue(int(s.value(f"eq{i}")))
         self.pattern.setCurrentIndex(int(s.value("pattern", 0)))
+        self.buffer.setCurrentIndex(int(s.value("buffer", 1)))
         for key, combo in (("in", self.cin), ("out", self.cout)):
             name = s.value(key, "")
             if name and combo.findText(name) >= 0:
@@ -498,36 +803,36 @@ class Main(QMainWindow):
         self.engine.source = s.value("source", "system")
         self.engine.mode_8d = s.value("mode8d", "true") == "true"
         self.engine.auto = s.value("auto", "true") == "true"
+        self.cb_tray.setChecked(s.value("close_to_tray", "true") == "true")
 
-    def closeEvent(self, e):
+    def save_settings(self):
         s = self.settings
-        s.setValue("speed", self.s_speed.value())
-        s.setValue("dist", self.s_dist.value())
-        s.setValue("room", self.s_room.value())
-        s.setValue("vol", self.s_vol.value())
+        for key, w in self.slider_map().items():
+            s.setValue(key, w.value())
+        for i, sl in enumerate(self.eq_sliders):
+            s.setValue(f"eq{i}", sl.value())
         s.setValue("pattern", self.pattern.currentIndex())
+        s.setValue("buffer", self.buffer.currentIndex())
         s.setValue("in", self.cin.currentText())
         s.setValue("out", self.cout.currentText())
         s.setValue("source", self.engine.source)
         s.setValue("mode8d", "true" if self.engine.mode_8d else "false")
         s.setValue("auto", "true" if self.engine.auto else "false")
-        self.engine.stop()
-        self.route_windows(False)
-        super().closeEvent(e)
+        s.setValue("close_to_tray", "true" if self.cb_tray.isChecked() else "false")
+        s.setValue("was_running", "true" if self.engine.running and self.engine.source == "system" else "false")
 
     def reset(self):
-        self.s_speed.setValue(12)
-        self.s_dist.setValue(75)
-        self.s_room.setValue(25)
+        self.apply_preset("Классика 8D")
         self.s_vol.setValue(90)
-        self.pattern.setCurrentIndex(0)
+        self.buffer.setCurrentIndex(1)
+        self.preset.setCurrentIndex(0)
         self.engine.manual_xy = (0.0, 0.75)
         self.engine.phase = 0.0
-        self.engine.mode_8d = True
-        self.engine.auto = True
         self.engine.error = ""
         self.set_source("system")
+        custom = self.settings.value("custom_presets", "{}")
         self.settings.clear()
+        self.settings.setValue("custom_presets", custom)  # свои пресеты не трогаем
         self.load_devices()
         self.refresh()
 
@@ -536,6 +841,9 @@ class Main(QMainWindow):
         if not self.engine.mode_8d:
             self.set_mode(True)
         self.set_auto(False)
+
+    def on_pad_height(self, delta):
+        self.s_elev.setValue(self.s_elev.value() + delta)
 
     def set_mode(self, on):
         self.engine.mode_8d = on
@@ -554,6 +862,7 @@ class Main(QMainWindow):
 
     def start(self):
         e = self.engine
+        e.error = ""
         if self.cout.currentData() is None:
             e.error = "Не найдено устройство вывода."
         elif "CABLE" in self.cout.currentText():
@@ -629,7 +938,7 @@ class Main(QMainWindow):
     def do_seek(self):
         e = self.engine
         if e.track is not None:
-            e.track_pos = int(len(e.track) * self.seek.value() / 1000)
+            e.track_pos = float(int(len(e.track) * self.seek.value() / 1000))
 
     def keyPressEvent(self, ev):
         if ev.key() == Qt.Key_Space:
@@ -647,6 +956,8 @@ class Main(QMainWindow):
             self.load_path(urls[0].toLocalFile())
 
     def tick(self):
+        if not self.isVisible():
+            return  # в трее не тратим процессор на отрисовку
         self.pad.tick()
         for m in self.meters:
             m.tick()
@@ -661,8 +972,8 @@ class Main(QMainWindow):
             self.bplay.setText("❚❚" if playing else "▶")
         # диагностика: режим «весь ПК», а сигнала с кабеля нет
         if e.running and e.source == "system" and not e.error:
-            self.silent_ticks = 0 if e.in_level > 0.0005 else getattr(self, "silent_ticks", 0) + 1
-            if self.silent_ticks == 180:
+            self.silent_ticks = 0 if e.in_level > 0.0005 else self.silent_ticks + 1
+            if self.silent_ticks == 90:
                 self.status.setText("⚠  Сигнала нет. Включи музыку; если играет — перезапусти плеер "
                                     "(он остался на старом устройстве) или жми «🎵 Файл».")
                 self.status.setStyleSheet("color: #f472b6;")
@@ -688,7 +999,6 @@ class Main(QMainWindow):
         except Exception as ex:  # noqa: BLE001
             self.engine.error = f"Не удалось переключить звук Windows: {ex}"
 
-
     def toggle(self):
         if self.engine.running:
             self.engine.stop()
@@ -709,12 +1019,19 @@ class Main(QMainWindow):
         self.cin_lbl.setVisible(e.source == "system")
         self.pattern.setEnabled(e.auto)
         self.s_speed.setEnabled(e.auto)
+        self.s_wob.setEnabled(e.auto)
         if e.track_name:
             self.track_lbl.setText(e.track_name)
         self.power.setText("■  ВЫКЛЮЧИТЬ" if e.running else "▶  ВКЛЮЧИТЬ")
         self.power.setProperty("on", "true" if e.running else "false")
         self.power.style().unpolish(self.power)
         self.power.style().polish(self.power)
+        if hasattr(self, "tray"):
+            self.tray.setIcon(app_icon(e.running))
+            state = ("8D" if e.mode_8d else "2D") if e.running else "выключено"
+            self.tray.setToolTip(f"8D Sound — {state}")
+            self.m_power.setText("Выключить" if e.running else "Включить")
+            self.m_mode.setChecked(e.mode_8d)
         if e.error:
             self.status.setText("⚠  " + e.error)
             self.status.setStyleSheet("color: #f472b6;")
@@ -733,8 +1050,12 @@ def main():
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("6ixl.8dsound")
     app = QApplication(sys.argv)
     app.setStyle("Fusion")
-    w = Main()
-    w.show()
+    app.setQuitOnLastWindowClosed(False)
+    app.setWindowIcon(app_icon())
+    tray_start = "--tray" in sys.argv
+    w = Main(tray_start)
+    if not tray_start:
+        w.show()
     sys.exit(app.exec())
 
 
