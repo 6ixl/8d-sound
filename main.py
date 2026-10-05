@@ -604,6 +604,8 @@ class Main(QMainWindow):
 
     def play_demo(self):
         self.engine.load_track(demo_track(), 48000, "Тестовый луп 8D")
+        self.engine.mode_8d = True  # тест всегда в 8D, с вращением
+        self.set_auto(True)
         self.begin_playback()
 
     def begin_playback(self):
