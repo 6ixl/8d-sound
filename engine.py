@@ -230,6 +230,20 @@ class Resampler:
 
 
 PATTERNS = ["Круг", "Восьмёрка", "Маятник", "Спираль"]
+SPLITS = ["Один источник", "Два источника: инструменты и верха в разные стороны", "Вокал по центру, музыка кружит"]
+
+
+class BandSplit:
+    """Стерео-фильтр с сохранением состояния между блоками."""
+
+    def __init__(self, sos):
+        self.sos = sos
+        self.zi = np.zeros((sos.shape[0], 2, 2))
+
+    def __call__(self, x):
+        from scipy.signal import sosfilt
+        y, self.zi = sosfilt(self.sos, x, axis=0, zi=self.zi)
+        return y.astype(np.float32)
 EQ_FREQS = [60, 250, 1000, 4000, 12000]
 
 
@@ -299,6 +313,7 @@ class Engine:
         self.eq = [0.0] * 5    # дБ
         self.bass = 0.0        # дБ
         self.buffer_ms = 50    # запас буфера
+        self.split = 0         # см. SPLITS
         self.rate = 1.0        # скорость трека (slowed)
         self.pos_z = 0.0
         self.manual_xy = (0.0, 0.75)  # x вправо, y вперёд
@@ -318,6 +333,12 @@ class Engine:
         self.running = False
         self.error = ""
         self._in = self._out = None
+
+    def _init_split(self, sr):
+        from scipy.signal import butter
+        self.spat2 = Spatializer(sr)
+        self.hp_split = BandSplit(butter(2, 3500, "highpass", fs=sr, output="sos"))
+        self.voc_split = BandSplit(butter(2, [280, 3800], "bandpass", fs=sr, output="sos"))
 
     def block(self):
         return 256 if self.buffer_ms <= 25 else 512 if self.buffer_ms <= 60 else 1024
@@ -374,6 +395,7 @@ class Engine:
             sr_in, sr_out = int(din["default_samplerate"]), int(dout["default_samplerate"])
             ch_in = min(2, din["max_input_channels"])
             self.spat = Spatializer(sr_in)
+            self._init_split(sr_in)
             self.equalizer = Equalizer(sr_in)
             self.resampler = Resampler(sr_in, sr_out) if sr_in != sr_out else None
             self.fifo = Fifo(sr_out * 2, int(sr_out * self.buffer_ms / 1000))
@@ -425,6 +447,7 @@ class Engine:
         try:
             sr = self.track_sr
             self.spat = Spatializer(sr)
+            self._init_split(sr)
             self.equalizer = Equalizer(sr)
 
             def out_cb(outdata, frames, t, status):
@@ -469,7 +492,18 @@ class Engine:
     def process(self, block, sr):
         n = len(block)
         theta, dist, elev = self._advance(n, sr)
-        wet = self.spat.process(block, theta, dist, self.room * 0.9, elev)
+        room = self.room * 0.9
+        if self.split == 1:  # верха летят с противоположной стороны
+            top = self.hp_split(block)
+            wet = self.spat.process(block - top, theta, dist, room, elev)
+            wet += self.spat2.process(top, theta + math.pi, dist, room * 0.3, -elev)
+        elif self.split == 2:  # голос спереди по центру, остальное кружит
+            mid = block.mean(axis=1, keepdims=True)
+            voc = self.voc_split(np.repeat(mid, 2, axis=1)) * 0.85
+            wet = self.spat.process(block - voc, theta, dist, room, elev)
+            wet += self.spat2.process(voc, 0.0, 0.25, room * 0.5, 0.0)
+        else:
+            wet = self.spat.process(block, theta, dist, room, elev)
         target = 1.0 if self.mode_8d else 0.0
         ramp = np.linspace(self.mix, target, n, dtype=np.float32)[:, None]
         self.mix = target

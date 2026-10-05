@@ -10,9 +10,10 @@ from PySide6.QtGui import (QBrush, QColor, QFont, QIcon, QLinearGradient, QPaint
                            QPen, QPixmap, QRadialGradient)
 from PySide6.QtWidgets import (QApplication, QCheckBox, QComboBox, QFileDialog, QFrame, QHBoxLayout,
                                QInputDialog, QLabel, QMainWindow, QMenu, QPushButton, QSlider,
-                               QSystemTrayIcon, QTabWidget, QVBoxLayout, QWidget)
+                               QSystemTrayIcon, QTabWidget, QVBoxLayout, QWidget, QListWidget, QListWidgetItem)
 
-from engine import PATTERNS, Engine, demo_track
+from engine import PATTERNS, SPLITS, Engine, demo_track
+import appaudio
 import winaudio
 from icon import app_icon, render
 
@@ -69,6 +70,12 @@ QCheckBox { spacing: 8px; }
 QCheckBox::indicator { width: 18px; height: 18px; border-radius: 6px; border: 1px solid #a855f7;
                        background: rgba(30, 12, 55, 0.9); }
 QCheckBox::indicator:checked { background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #7c3aed, stop:1 #c026d3); }
+QListWidget { background: rgba(30, 12, 55, 0.6); border: 1px solid rgba(168, 85, 247, 0.3); border-radius: 10px;
+              padding: 4px; outline: none; }
+QListWidget::item { padding: 7px 6px; border-radius: 6px; }
+QListWidget::item:hover { background: rgba(124, 58, 237, 0.3); }
+QListWidget::indicator { width: 16px; height: 16px; border-radius: 5px; border: 1px solid #a855f7; }
+QListWidget::indicator:checked { background: #a855f7; }
 QToolTip { background: #1a0b30; color: #f3e8ff; border: 1px solid #7c3aed; }
 QInputDialog, QMessageBox { background: #120822; }
 QLineEdit { background: rgba(30, 12, 55, 0.9); border: 1px solid #7c3aed; border-radius: 8px; padding: 6px; }
@@ -87,10 +94,11 @@ class SpacePad(QWidget):
     moved = Signal(float, float)
     height = Signal(int)
 
-    def __init__(self, engine):
+    def __init__(self, engine, size=380, compact=False):
         super().__init__()
         self.engine = engine
-        self.setMinimumSize(380, 380)
+        self.compact = compact
+        self.setMinimumSize(size, size)
         self.trail = []
         self.spectrum = np.zeros(72)
         self.t = 0.0
@@ -207,7 +215,8 @@ class SpacePad(QWidget):
         p.setPen(QColor(183, 148, 246, 170))
         f = QFont("Segoe UI", 9, QFont.Bold)
         p.setFont(f)
-        for txt, dx, dy in (("ПЕРЕД", 0, -1), ("ЗАД", 0, 1), ("Л", -1, 0), ("П", 1, 0)):
+        labels = (("ПЕРЕД", 0, -1), ("ЗАД", 0, 1), ("Л", -1, 0), ("П", 1, 0))
+        for txt, dx, dy in labels if not self.compact else ():
             rect = QRectF(c.x() + dx * (r - 22) - 30, c.y() + dy * (r - 14) - 10, 60, 20)
             p.drawText(rect, Qt.AlignCenter, txt)
 
@@ -220,6 +229,29 @@ class SpacePad(QWidget):
             p.setPen(Qt.NoPen)
             p.setBrush(QColor(232, 121, 249, int(120 * k)))
             p.drawEllipse(pt(xy), 3 + 6 * k, 3 + 6 * k)
+        def extra_dot(xy, label):
+            q = pt(xy)
+            g2 = QRadialGradient(q, 26)
+            g2.setColorAt(0, QColor(196, 181, 253, 200))
+            g2.setColorAt(1, QColor(124, 58, 237, 0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(g2)
+            p.drawEllipse(q, 26, 26)
+            p.setBrush(QColor("#ede9fe"))
+            p.setPen(QPen(VIOLET, 2))
+            p.drawEllipse(q, 6, 6)
+            if not self.compact:
+                p.setPen(QColor("#c4b5fd"))
+                p.setFont(QFont("Segoe UI", 8, QFont.Bold))
+                p.drawText(QPointF(q.x() + 10, q.y() + 16), label)
+
+        if self.trail and self.engine.mode_8d:
+            if self.engine.split == 1:
+                x, y = self.trail[-1]
+                extra_dot((-x, -y), "верха")
+            elif self.engine.split == 2:
+                extra_dot((0.0, 0.25), "голос")
+
         if self.trail:
             s = pt(self.trail[-1])
             lvl = min(1.0, self.engine.level * 6)
@@ -227,6 +259,7 @@ class SpacePad(QWidget):
             glow.setColorAt(0, QColor(240, 171, 252, 230))
             glow.setColorAt(0.35, QColor(192, 38, 211, 120))
             glow.setColorAt(1, QColor(124, 58, 237, 0))
+            p.setPen(Qt.NoPen)
             p.setBrush(glow)
             p.drawEllipse(s, 34 + 20 * lvl, 34 + 20 * lvl)
             z = self.engine.pos_z if self.engine.mode_8d else 0.0
@@ -234,7 +267,7 @@ class SpacePad(QWidget):
             p.setBrush(QColor("#fdf4ff"))
             p.setPen(QPen(PINK, 3))
             p.drawEllipse(s, rad, rad)
-            if abs(z) > 0.04:
+            if abs(z) > 0.04 and not self.compact:
                 p.setPen(QColor("#f5d0fe"))
                 p.setFont(QFont("Segoe UI", 9, QFont.Bold))
                 p.drawText(QPointF(s.x() + 16, s.y() - 12), f"{'↑' if z > 0 else '↓'} {abs(z) * 100:.0f}%")
@@ -300,6 +333,108 @@ def card():
     return f, lay
 
 
+class MiniPlayer(QWidget):
+    """Маленькое окно поверх всех окон: круг, вкл/выкл, 2D/8D, пауза."""
+
+    def __init__(self, main):
+        super().__init__(None, Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint)
+        self.main = main
+        self.setAttribute(Qt.WA_TranslucentBackground)
+        self.setWindowTitle("8D Sound — мини")
+        self.drag = None
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(14, 10, 14, 14)
+        lay.setSpacing(8)
+
+        top = QHBoxLayout()
+        logo = QLabel()
+        logo.setPixmap(render(22))
+        self.title = QLabel("8D SOUND")
+        self.title.setObjectName("section")
+        bmax = QPushButton("⤢")
+        bmax.setToolTip("Открыть полное окно")
+        bmax.clicked.connect(self.expand)
+        bclose = QPushButton("✕")
+        bclose.setToolTip("Свернуть в трей")
+        bclose.clicked.connect(self.hide)
+        for b in (bmax, bclose):
+            b.setObjectName("mini")
+            b.setFixedSize(28, 28)
+            b.setCursor(Qt.PointingHandCursor)
+        top.addWidget(logo)
+        top.addWidget(self.title)
+        top.addStretch()
+        top.addWidget(bmax)
+        top.addWidget(bclose)
+        lay.addLayout(top)
+
+        self.pad = SpacePad(main.engine, 200, compact=True)
+        self.pad.moved.connect(main.on_pad)
+        self.pad.height.connect(main.on_pad_height)
+        lay.addWidget(self.pad, 1)
+
+        row = QHBoxLayout()
+        self.bpower = QPushButton("⏻")
+        self.bpower.setToolTip("Включить / выключить")
+        self.bpower.clicked.connect(main.toggle)
+        self.bmode = QPushButton("8D")
+        self.bmode.setToolTip("Переключить 2D / 8D")
+        self.bmode.clicked.connect(lambda: main.set_mode(not main.engine.mode_8d))
+        self.bplay = QPushButton("▶")
+        self.bplay.setToolTip("Плеер: пауза / играть")
+        self.bplay.clicked.connect(main.play_pause)
+        for b in (self.bpower, self.bmode, self.bplay):
+            b.setCheckable(b is not self.bplay)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(38)
+            row.addWidget(b)
+        lay.addLayout(row)
+        self.setStyleSheet(STYLE + """
+            #mini { padding: 0; border-radius: 8px; font-size: 13px; }
+        """)
+        self.resize(250, 320)
+        scr = QApplication.primaryScreen().availableGeometry()
+        self.move(scr.right() - 270, scr.bottom() - 340)
+
+    def paintEvent(self, _):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        g = QLinearGradient(0, 0, self.width(), self.height())
+        g.setColorAt(0, QColor(30, 12, 55, 240))
+        g.setColorAt(1, QColor(10, 5, 20, 245))
+        p.setBrush(g)
+        p.setPen(QPen(QColor(168, 85, 247, 140), 1.2))
+        p.drawRoundedRect(QRectF(self.rect()).adjusted(1, 1, -1, -1), 20, 20)
+
+    def mousePressEvent(self, e):
+        if e.button() == Qt.LeftButton:
+            self.drag = e.globalPosition().toPoint() - self.frameGeometry().topLeft()
+
+    def mouseMoveEvent(self, e):
+        if self.drag is not None and e.buttons() & Qt.LeftButton:
+            self.move(e.globalPosition().toPoint() - self.drag)
+
+    def mouseReleaseEvent(self, e):
+        self.drag = None
+
+    def expand(self):
+        self.hide()
+        self.main.show_window()
+
+    def tick(self):
+        self.pad.tick()
+        e = self.main.engine
+        playing = e.running and e.source == "file" and e.playing
+        self.bplay.setText("❚❚" if playing else "▶")
+
+    def refresh(self):
+        e = self.main.engine
+        self.bpower.setChecked(e.running)
+        self.bmode.setChecked(e.mode_8d)
+        self.bmode.setText("8D" if e.mode_8d else "2D")
+        self.title.setText("8D SOUND · " + ("в эфире" if e.running else "выкл"))
+
+
 PRESETS = {
     "Классика 8D": dict(pattern=0, speed=12, dist=75, room=25, elev=0, wobble=0, eq=[0, 0, 0, 0, 0], bass=0, rate=100),
     "Концертный зал": dict(pattern=0, speed=6, dist=95, room=80, elev=10, wobble=10, eq=[1, 0, 0, 1, 2], bass=2, rate=100),
@@ -307,6 +442,7 @@ PRESETS = {
     "Под водой": dict(pattern=0, speed=5, dist=60, room=45, elev=-20, wobble=15, eq=[4, 2, -6, -14, -18], bass=4, rate=100),
     "Космос": dict(pattern=3, speed=8, dist=100, room=100, elev=20, wobble=60, eq=[0, 0, 0, 2, 4], bass=2, rate=100),
     "Slowed + reverb": dict(pattern=0, speed=8, dist=70, room=70, elev=0, wobble=0, eq=[2, 1, 0, -1, -2], bass=3, rate=82),
+    "Nightcore": dict(pattern=0, speed=22, dist=70, room=30, elev=10, wobble=0, eq=[0, 0, 1, 3, 4], bass=2, rate=125),
     "Бас-качалка": dict(pattern=1, speed=15, dist=65, room=20, elev=0, wobble=20, eq=[6, 2, 0, 1, 2], bass=8, rate=100),
 }
 
@@ -352,6 +488,10 @@ class Main(QMainWindow):
         self.settings = QSettings("6ixl", "8D Sound")
         self.quitting = False
         self.silent_ticks = 0
+        self.app_tick = 0
+        self.mini = None
+        self.routed_pids = set()
+        self.selected_apps = set()
         self.setWindowTitle("8D Sound")
         self.setWindowIcon(app_icon())
         self.resize(1120, 780)
@@ -373,6 +513,11 @@ class Main(QMainWindow):
         head.addWidget(logo)
         head.addWidget(title)
         head.addStretch()
+        bmini = QPushButton("▣  Мини-плеер")
+        bmini.setCursor(Qt.PointingHandCursor)
+        bmini.setToolTip("Маленькое окно поверх всех окон")
+        bmini.clicked.connect(self.show_mini)
+        head.addWidget(bmini)
         left.addLayout(head)
         self.status = QLabel()
         self.status.setObjectName("subtitle")
@@ -472,6 +617,11 @@ class Main(QMainWindow):
         self.pattern.addItems(PATTERNS)
         self.pattern.currentIndexChanged.connect(lambda i: setattr(self.engine, "pattern", i))
         m1.addWidget(self.pattern)
+        self.split = QComboBox()
+        self.split.addItems(SPLITS)
+        self.split.setToolTip("Разделить музыку на несколько источников в пространстве")
+        self.split.currentIndexChanged.connect(lambda i: setattr(self.engine, "split", i))
+        m1.addWidget(self.split)
         self.s_speed = self.slider(m1, "Скорость", 2, 60, 12, lambda v: f"{100 / v:.1f} с/оборот",
                                    lambda v: setattr(self.engine, "speed", v / 100))
         self.s_dist = self.slider(m1, "Дистанция", 15, 100, 75, lambda v: f"{v}%",
@@ -489,8 +639,9 @@ class Main(QMainWindow):
                                   lambda v: setattr(self.engine, "room", v / 100))
         self.s_vol = self.slider(m2, "Громкость", 0, 150, 90, lambda v: f"{v}%",
                                  lambda v: setattr(self.engine, "volume", v / 100))
-        self.s_rate = self.slider(m2, "Slowed (только файл)", 60, 100, 100,
-                                  lambda v: "обычная скорость" if v == 100 else f"{v}% скорости",
+        self.s_rate = self.slider(m2, "Slowed ↔ Nightcore (только файл)", 60, 150, 100,
+                                  lambda v: "обычная скорость" if v == 100 else
+                                  (f"slowed {v}%" if v < 100 else f"nightcore {v}%"),
                                   lambda v: setattr(self.engine, "rate", v / 100))
         sec = QLabel("ЭКВАЛАЙЗЕР")
         sec.setObjectName("section")
@@ -523,18 +674,35 @@ class Main(QMainWindow):
         m2.addWidget(beq)
         m2.addStretch()
 
-        # вкладка «Настройки»
-        t3, m3 = self.tab("Настройки")
+        # вкладка «Источник»
+        t0, m0 = self.tab("Источник", 0)
         src = QHBoxLayout()
-        self.bsys = QPushButton("🖥  Весь звук ПК")
+        self.bsys = QPushButton("🖥  Весь ПК")
+        self.bapps = QPushButton("🎯  Программы")
         self.bfile = QPushButton("🎵  Файл")
-        for b in (self.bsys, self.bfile):
+        for b in (self.bsys, self.bapps, self.bfile):
             b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
             src.addWidget(b)
         self.bsys.clicked.connect(lambda: self.set_source("system"))
+        self.bapps.clicked.connect(lambda: self.set_source("apps"))
         self.bfile.clicked.connect(lambda: self.set_source("file"))
-        m3.addLayout(src)
+        m0.addLayout(src)
+        self.src_hint = QLabel()
+        self.src_hint.setObjectName("hint")
+        self.src_hint.setWordWrap(True)
+        m0.addWidget(self.src_hint)
+        self.apps_list = QListWidget()
+        self.apps_list.itemChanged.connect(self.apps_changed)
+        m0.addWidget(self.apps_list, 1)
+        self.bref_apps = QPushButton("↻  Обновить список программ")
+        self.bref_apps.setCursor(Qt.PointingHandCursor)
+        self.bref_apps.clicked.connect(self.load_apps)
+        m0.addWidget(self.bref_apps)
+        m0.addStretch()
+
+        # вкладка «Настройки»
+        t3, m3 = self.tab("Настройки")
         self.cin = QComboBox()
         self.cout = QComboBox()
         self.cin_lbl = QLabel("Откуда брать (VB-Cable Output)")
@@ -600,6 +768,12 @@ class Main(QMainWindow):
         self.setStyleSheet(STYLE)
         self.load_devices()
         self.restore()
+        try:
+            self.selected_apps = set(json.loads(self.settings.value("apps", "[]")))
+        except (TypeError, ValueError):
+            self.selected_apps = set()
+        self.load_apps()
+        self.tabs.setCurrentIndex(0)
         self.reload_presets()
         self.cin.currentIndexChanged.connect(self.devices_changed)
         self.cout.currentIndexChanged.connect(self.devices_changed)
@@ -615,12 +789,12 @@ class Main(QMainWindow):
             self.start()
 
     # ---------- построение ----------
-    def tab(self, name):
+    def tab(self, name, index=-1):
         w = QWidget()
         lay = QVBoxLayout(w)
         lay.setContentsMargins(16, 16, 16, 12)
         lay.setSpacing(12)
-        self.tabs.addTab(w, name)
+        self.tabs.insertTab(index, w, name)
         return w, lay
 
     def slider(self, layout, title, lo, hi, val, fmt, on_change):
@@ -635,6 +809,7 @@ class Main(QMainWindow):
         menu = QMenu()
         menu.setStyleSheet(MENU_STYLE)
         self.m_show = menu.addAction("Открыть 8D Sound", self.show_window)
+        menu.addAction("Мини-плеер", self.show_mini)
         menu.addSeparator()
         self.m_power = menu.addAction("Включить", self.toggle)
         self.m_mode = menu.addAction("Режим 8D", lambda: self.set_mode(not self.engine.mode_8d))
@@ -669,6 +844,9 @@ class Main(QMainWindow):
         self.save_settings()
         self.engine.stop()
         self.route_windows(False)
+        self.unroute_apps()
+        if self.mini:
+            self.mini.close()
         self.tray.hide()
         e.accept()
         QApplication.quit()
@@ -679,6 +857,73 @@ class Main(QMainWindow):
         except OSError as ex:
             self.engine.error = f"Автозапуск: {ex}"
             self.refresh()
+
+    # ---------- программы ----------
+    def load_apps(self):
+        try:
+            playing = appaudio.sessions()
+        except Exception:  # noqa: BLE001
+            playing = {}
+        names = sorted(set(playing) | self.selected_apps, key=str.lower)
+        self.apps_list.blockSignals(True)
+        self.apps_list.clear()
+        for exe in names:
+            item = QListWidgetItem(("🔊  " if exe in playing else "      ") + appaudio.pretty(exe))
+            item.setData(Qt.UserRole, exe)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if exe in self.selected_apps else Qt.Unchecked)
+            self.apps_list.addItem(item)
+        if not names:
+            item = QListWidgetItem("Сейчас ни одна программа не играет звук")
+            item.setFlags(Qt.NoItemFlags)
+            self.apps_list.addItem(item)
+        self.apps_list.blockSignals(False)
+
+    def apps_changed(self, item):
+        exe = item.data(Qt.UserRole)
+        if not exe:
+            return
+        if item.checkState() == Qt.Checked:
+            self.selected_apps.add(exe)
+        else:
+            self.selected_apps.discard(exe)
+            if self.engine.running and self.engine.source == "apps":
+                appaudio.route_apps([exe], None)
+                self.routed_pids = {p for p in self.routed_pids if p[0] != exe}
+        if self.engine.running and self.engine.source == "apps":
+            self.route_selected_apps()
+        self.refresh()
+
+    def route_selected_apps(self):
+        cable = winaudio.find_output("CABLE Input")
+        if not cable:
+            return
+        for exe in self.selected_apps:
+            for pid in appaudio._pids_of(exe):
+                if (exe, pid) in self.routed_pids:
+                    continue
+                try:
+                    appaudio._set_persisted(pid, cable)
+                    self.routed_pids.add((exe, pid))
+                except OSError:
+                    pass  # у процесса пока нет звука — попробуем позже
+
+    def unroute_apps(self):
+        for _, pid in self.routed_pids:
+            try:
+                appaudio._set_persisted(pid, None)
+            except OSError:
+                pass
+        self.routed_pids = set()
+
+    # ---------- мини-плеер ----------
+    def show_mini(self):
+        if self.mini is None:
+            self.mini = MiniPlayer(self)
+        self.hide()
+        self.mini.show()
+        self.mini.raise_()
+        self.mini.refresh()
 
     # ---------- пресеты ----------
     def custom_presets(self):
@@ -795,6 +1040,7 @@ class Main(QMainWindow):
             if s.contains(f"eq{i}"):
                 sl.setValue(int(s.value(f"eq{i}")))
         self.pattern.setCurrentIndex(int(s.value("pattern", 0)))
+        self.split.setCurrentIndex(int(s.value("split", 0)))
         self.buffer.setCurrentIndex(int(s.value("buffer", 1)))
         for key, combo in (("in", self.cin), ("out", self.cout)):
             name = s.value(key, "")
@@ -812,6 +1058,8 @@ class Main(QMainWindow):
         for i, sl in enumerate(self.eq_sliders):
             s.setValue(f"eq{i}", sl.value())
         s.setValue("pattern", self.pattern.currentIndex())
+        s.setValue("split", self.split.currentIndex())
+        s.setValue("apps", json.dumps(sorted(self.selected_apps), ensure_ascii=False))
         s.setValue("buffer", self.buffer.currentIndex())
         s.setValue("in", self.cin.currentText())
         s.setValue("out", self.cout.currentText())
@@ -819,7 +1067,7 @@ class Main(QMainWindow):
         s.setValue("mode8d", "true" if self.engine.mode_8d else "false")
         s.setValue("auto", "true" if self.engine.auto else "false")
         s.setValue("close_to_tray", "true" if self.cb_tray.isChecked() else "false")
-        s.setValue("was_running", "true" if self.engine.running and self.engine.source == "system" else "false")
+        s.setValue("was_running", "true" if self.engine.running and self.engine.source != "file" else "false")
 
     def reset(self):
         self.apply_preset("Классика 8D")
@@ -872,7 +1120,13 @@ class Main(QMainWindow):
             e.start_file(self.cout.currentData())
         elif self.cin.currentData() is None:
             e.error = "Не найден VB-Cable. Установи его (vb-audio.com/Cable) или выбери «Файл»."
+        elif e.source == "apps":
+            self.route_windows(False)
+            if e.start(self.cin.currentData(), self.cout.currentData()):
+                self.routed_pids = set()
+                self.route_selected_apps()
         elif e.start(self.cin.currentData(), self.cout.currentData()):
+            self.unroute_apps()
             self.route_windows(True)
         self.silent_ticks = 0
         self.refresh()
@@ -883,6 +1137,7 @@ class Main(QMainWindow):
             return
         was = self.engine.running
         self.engine.stop()
+        self.unroute_apps()
         self.engine.source = src
         if src == "system":
             self.engine.playing = False
@@ -956,6 +1211,11 @@ class Main(QMainWindow):
             self.load_path(urls[0].toLocalFile())
 
     def tick(self):
+        self.app_tick += 1
+        if self.engine.running and self.engine.source == "apps" and self.app_tick % 60 == 0:
+            self.route_selected_apps()  # раз в ~2 с подхватываем новые процессы
+        if self.mini and self.mini.isVisible():
+            self.mini.tick()
         if not self.isVisible():
             return  # в трее не тратим процессор на отрисовку
         self.pad.tick()
@@ -1003,6 +1263,7 @@ class Main(QMainWindow):
         if self.engine.running:
             self.engine.stop()
             self.route_windows(False)
+            self.unroute_apps()
             self.refresh()
         else:
             self.start()
@@ -1014,9 +1275,20 @@ class Main(QMainWindow):
         self.bauto.setChecked(e.auto)
         self.bhand.setChecked(not e.auto)
         self.bsys.setChecked(e.source == "system")
+        self.bapps.setChecked(e.source == "apps")
         self.bfile.setChecked(e.source == "file")
-        self.cin.setVisible(e.source == "system")
-        self.cin_lbl.setVisible(e.source == "system")
+        self.cin.setVisible(e.source != "file")
+        self.cin_lbl.setVisible(e.source != "file")
+        self.apps_list.setVisible(e.source == "apps")
+        self.bref_apps.setVisible(e.source == "apps")
+        self.src_hint.setText({
+            "system": "Весь звук компьютера (музыка, игры, Discord) идёт через 8D. Нужен VB-Cable.",
+            "apps": "В 8D только отмеченные программы, остальное звучит как обычно. В списке — программы, "
+                    "которые сейчас издают звук: включи в них музыку и нажми «Обновить».",
+            "file": "Встроенный плеер: открой трек или перетащи его в окно. Кабель не нужен.",
+        }[e.source])
+        if self.mini:
+            self.mini.refresh()
         self.pattern.setEnabled(e.auto)
         self.s_speed.setEnabled(e.auto)
         self.s_wob.setEnabled(e.auto)
@@ -1036,7 +1308,11 @@ class Main(QMainWindow):
             self.status.setText("⚠  " + e.error)
             self.status.setStyleSheet("color: #f472b6;")
         elif e.running:
-            src = "весь звук ПК" if e.source == "system" else "файл"
+            if e.source == "apps":
+                names = ", ".join(appaudio.pretty(a) for a in sorted(self.selected_apps)) or "программы не выбраны"
+                src = names
+            else:
+                src = "весь звук ПК" if e.source == "system" else "файл"
             self.status.setText(f"● В эфире — {'8D' if e.mode_8d else '2D'} · {src}")
             self.status.setStyleSheet("color: #c084fc;")
         else:
