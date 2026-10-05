@@ -73,6 +73,8 @@ class SpacePad(QWidget):
 
     def tick(self):
         self.t += 1 / 60
+        if not self.engine.running:  # без звука двигаем точку сами
+            self.engine._advance(1, 60)
         sc = self.engine.scope
         if self.engine.running:
             spec = np.abs(np.fft.rfft(sc * np.hanning(len(sc))))[1:400]
@@ -102,6 +104,12 @@ class SpacePad(QWidget):
     def mouseMoveEvent(self, e):
         if e.buttons() & Qt.LeftButton:
             self.moved.emit(*self._to_xy(e.position()))
+
+    def wheelEvent(self, e):
+        x, y = self.engine.pos_xy
+        r = max(0.15, math.hypot(x, y))
+        a = math.atan2(x, y) + math.radians(e.angleDelta().y() / 120 * 10)
+        self.moved.emit(math.sin(a) * r, math.cos(a) * r)
 
     def mouseReleaseEvent(self, e):
         self.setCursor(Qt.OpenHandCursor)
@@ -267,7 +275,7 @@ class Main(QMainWindow):
         self.pad = SpacePad(self.engine)
         self.pad.moved.connect(self.on_pad)
         left.addWidget(self.pad, 1)
-        hint = QLabel("Схвати точку и тащи — звук пойдёт за ней. Центр = в голове, край = далеко.")
+        hint = QLabel("Тащи точку мышкой или крути колёсиком. Центр = в голове, край = далеко.")
         hint.setObjectName("hint")
         hint.setAlignment(Qt.AlignCenter)
         left.addWidget(hint)
@@ -358,6 +366,10 @@ class Main(QMainWindow):
         self.power.setCursor(Qt.PointingHandCursor)
         self.power.clicked.connect(self.toggle)
         right.addWidget(self.power)
+        reset = QPushButton("↺  Сбросить настройки")
+        reset.setCursor(Qt.PointingHandCursor)
+        reset.clicked.connect(self.reset)
+        right.addWidget(reset)
         right.addStretch()
         main.addLayout(right, 2)
 
@@ -416,6 +428,21 @@ class Main(QMainWindow):
         s.setValue("auto", "true" if self.engine.auto else "false")
         self.engine.stop()
         super().closeEvent(e)
+
+    def reset(self):
+        self.s_speed.setValue(12)
+        self.s_dist.setValue(75)
+        self.s_room.setValue(25)
+        self.s_vol.setValue(90)
+        self.pattern.setCurrentIndex(0)
+        self.engine.manual_xy = (0.0, 0.75)
+        self.engine.phase = 0.0
+        self.engine.mode_8d = True
+        self.engine.auto = True
+        self.engine.error = ""
+        self.settings.clear()
+        self.load_devices()
+        self.refresh()
 
     def on_pad(self, x, y):
         self.engine.manual_xy = (x, y)
