@@ -230,7 +230,7 @@ class Resampler:
 
 
 PATTERNS = ["Круг", "Восьмёрка", "Маятник", "Спираль"]
-SPLITS = ["Один источник", "Два источника: инструменты и верха в разные стороны", "Вокал по центру, музыка кружит"]
+SPLITS = ["Один источник", "Два источника: инструменты и верха в разные стороны", "Вокал отдельно (его можно таскать и вращать)"]
 
 
 class BandSplit:
@@ -313,6 +313,9 @@ class Engine:
         self.eq = [0.0] * 5    # дБ
         self.bass = 0.0        # дБ
         self.buffer_ms = 50    # запас буфера
+        self.vocal_xy = (0.0, 0.25)  # где стоит голос в режиме «Вокал»
+        self.vocal_auto = False      # вокал вращается сам
+        self.vocal_speed = -0.1      # об/с, минус — в обратную сторону
         self.split = 0         # см. SPLITS
         self.rate = 1.0        # скорость трека (slowed)
         self.pos_z = 0.0
@@ -376,6 +379,11 @@ class Engine:
             else:
                 rr = r * (0.35 + 0.65 * (0.5 + 0.5 * math.sin(a * 0.25)))
                 x, y = math.sin(a * 2) * rr, math.cos(a * 2) * rr
+        if self.vocal_auto and self.split == 2:
+            vx, vy = self.vocal_xy
+            r = max(0.15, math.hypot(vx, vy))
+            a = math.atan2(vx, vy) + 2 * math.pi * self.vocal_speed * n / sr
+            self.vocal_xy = (math.sin(a) * r, math.cos(a) * r)
         z = self.elevation
         if self.auto and self.elev_wobble:
             z += self.elev_wobble * math.sin(2 * math.pi * self.phase * 3)
@@ -501,7 +509,8 @@ class Engine:
             mid = block.mean(axis=1, keepdims=True)
             voc = self.voc_split(np.repeat(mid, 2, axis=1)) * 0.85
             wet = self.spat.process(block - voc, theta, dist, room, elev)
-            wet += self.spat2.process(voc, 0.0, 0.25, room * 0.5, 0.0)
+            vx, vy = self.vocal_xy
+            wet += self.spat2.process(voc, math.atan2(vx, vy), min(1.0, math.hypot(vx, vy)), room * 0.5, 0.0)
         else:
             wet = self.spat.process(block, theta, dist, room, elev)
         target = 1.0 if self.mode_8d else 0.0

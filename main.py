@@ -92,6 +92,7 @@ class SpacePad(QWidget):
     """Круг вокруг головы слушателя: показывает и задаёт положение звука."""
 
     moved = Signal(float, float)
+    vocal_moved = Signal(float, float)
     height = Signal(int)
 
     def __init__(self, engine, size=380, compact=False):
@@ -103,6 +104,8 @@ class SpacePad(QWidget):
         self.spectrum = np.zeros(72)
         self.t = 0.0
         self.setCursor(Qt.OpenHandCursor)
+        self.grab_vocal = False
+        self.setMouseTracking(True)
 
     def geometry_(self):
         side = min(self.width(), self.height()) - 30
@@ -135,13 +138,23 @@ class SpacePad(QWidget):
             x, y = x / k, y / k
         return x, y
 
+    def _near_vocal(self, pos):
+        if not (self.engine.mode_8d and self.engine.split == 2):
+            return False
+        c, r = self.geometry_()
+        vx, vy = self.engine.vocal_xy
+        return math.hypot(pos.x() - (c.x() + vx * r), pos.y() - (c.y() - vy * r)) < 24
+
     def mousePressEvent(self, e):
         self.setCursor(Qt.ClosedHandCursor)
-        self.moved.emit(*self._to_xy(e.position()))
+        self.grab_vocal = self._near_vocal(e.position())
+        (self.vocal_moved if self.grab_vocal else self.moved).emit(*self._to_xy(e.position()))
 
     def mouseMoveEvent(self, e):
         if e.buttons() & Qt.LeftButton:
-            self.moved.emit(*self._to_xy(e.position()))
+            (self.vocal_moved if self.grab_vocal else self.moved).emit(*self._to_xy(e.position()))
+        else:
+            self.setCursor(Qt.PointingHandCursor if self._near_vocal(e.position()) else Qt.OpenHandCursor)
 
     def wheelEvent(self, e):
         if e.modifiers() & Qt.ShiftModifier:
@@ -154,6 +167,7 @@ class SpacePad(QWidget):
         self.moved.emit(math.sin(a) * r, math.cos(a) * r)
 
     def mouseReleaseEvent(self, e):
+        self.grab_vocal = False
         self.setCursor(Qt.OpenHandCursor)
 
     def paintEvent(self, _):
@@ -250,7 +264,7 @@ class SpacePad(QWidget):
                 x, y = self.trail[-1]
                 extra_dot((-x, -y), "верха")
             elif self.engine.split == 2:
-                extra_dot((0.0, 0.25), "голос")
+                extra_dot(self.engine.vocal_xy, "голос")
 
         if self.trail:
             s = pt(self.trail[-1])
@@ -371,6 +385,7 @@ class MiniPlayer(QWidget):
         self.pad = SpacePad(main.engine, 200, compact=True)
         self.pad.moved.connect(main.on_pad)
         self.pad.height.connect(main.on_pad_height)
+        self.pad.vocal_moved.connect(main.on_vocal)
         lay.addWidget(self.pad, 1)
 
         row = QHBoxLayout()
@@ -526,6 +541,7 @@ class Main(QMainWindow):
         self.pad = SpacePad(self.engine)
         self.pad.moved.connect(self.on_pad)
         self.pad.height.connect(self.on_pad_height)
+        self.pad.vocal_moved.connect(self.on_vocal)
         left.addWidget(self.pad, 1)
         hint = QLabel("Тащи точку мышкой · колёсико — вращать · Shift + колёсико — высота")
         hint.setObjectName("hint")
@@ -620,8 +636,20 @@ class Main(QMainWindow):
         self.split = QComboBox()
         self.split.addItems(SPLITS)
         self.split.setToolTip("Разделить музыку на несколько источников в пространстве")
-        self.split.currentIndexChanged.connect(lambda i: setattr(self.engine, "split", i))
+        self.split.currentIndexChanged.connect(self.split_changed)
         m1.addWidget(self.split)
+        self.vocal_box = QWidget()
+        vb = QVBoxLayout(self.vocal_box)
+        vb.setContentsMargins(0, 0, 0, 0)
+        vb.setSpacing(8)
+        self.cb_vocal = QCheckBox("Вокал тоже вращается")
+        self.cb_vocal.toggled.connect(lambda on: (setattr(self.engine, "vocal_auto", on), self.refresh()))
+        vb.addWidget(self.cb_vocal)
+        self.s_vspeed = self.slider(vb, "Вращение вокала", -50, 50, -10,
+                                    lambda v: "стоит" if v == 0 else
+                                    f"{100 / abs(v):.1f} с/оборот {'↻' if v > 0 else '↺'}",
+                                    lambda v: setattr(self.engine, "vocal_speed", v / 100))
+        m1.addWidget(self.vocal_box)
         self.s_speed = self.slider(m1, "Скорость", 2, 60, 12, lambda v: f"{100 / v:.1f} с/оборот",
                                    lambda v: setattr(self.engine, "speed", v / 100))
         self.s_dist = self.slider(m1, "Дистанция", 15, 100, 75, lambda v: f"{v}%",
@@ -1041,6 +1069,12 @@ class Main(QMainWindow):
                 sl.setValue(int(s.value(f"eq{i}")))
         self.pattern.setCurrentIndex(int(s.value("pattern", 0)))
         self.split.setCurrentIndex(int(s.value("split", 0)))
+        self.cb_vocal.setChecked(s.value("vocal_auto", "false") == "true")
+        self.s_vspeed.setValue(int(s.value("vspeed", -10)))
+        try:
+            self.engine.vocal_xy = tuple(json.loads(s.value("vocal", "[0.0, 0.25]")))
+        except (TypeError, ValueError):
+            pass
         self.buffer.setCurrentIndex(int(s.value("buffer", 1)))
         for key, combo in (("in", self.cin), ("out", self.cout)):
             name = s.value(key, "")
@@ -1059,6 +1093,9 @@ class Main(QMainWindow):
             s.setValue(f"eq{i}", sl.value())
         s.setValue("pattern", self.pattern.currentIndex())
         s.setValue("split", self.split.currentIndex())
+        s.setValue("vocal_auto", "true" if self.engine.vocal_auto else "false")
+        s.setValue("vspeed", self.s_vspeed.value())
+        s.setValue("vocal", json.dumps(list(self.engine.vocal_xy)))
         s.setValue("apps", json.dumps(sorted(self.selected_apps), ensure_ascii=False))
         s.setValue("buffer", self.buffer.currentIndex())
         s.setValue("in", self.cin.currentText())
@@ -1075,6 +1112,10 @@ class Main(QMainWindow):
         self.buffer.setCurrentIndex(1)
         self.preset.setCurrentIndex(0)
         self.engine.manual_xy = (0.0, 0.75)
+        self.engine.vocal_xy = (0.0, 0.25)
+        self.split.setCurrentIndex(0)
+        self.cb_vocal.setChecked(False)
+        self.s_vspeed.setValue(-10)
         self.engine.phase = 0.0
         self.engine.error = ""
         self.set_source("system")
@@ -1089,6 +1130,13 @@ class Main(QMainWindow):
         if not self.engine.mode_8d:
             self.set_mode(True)
         self.set_auto(False)
+
+    def split_changed(self, i):
+        self.engine.split = i
+        self.refresh()
+
+    def on_vocal(self, x, y):
+        self.engine.vocal_xy = (x, y)
 
     def on_pad_height(self, delta):
         self.s_elev.setValue(self.s_elev.value() + delta)
@@ -1292,6 +1340,8 @@ class Main(QMainWindow):
         self.pattern.setEnabled(e.auto)
         self.s_speed.setEnabled(e.auto)
         self.s_wob.setEnabled(e.auto)
+        self.vocal_box.setVisible(e.split == 2)
+        self.s_vspeed.setEnabled(e.vocal_auto)
         if e.track_name:
             self.track_lbl.setText(e.track_name)
         self.power.setText("■  ВЫКЛЮЧИТЬ" if e.running else "▶  ВКЛЮЧИТЬ")
