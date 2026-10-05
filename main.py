@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (QApplication, QComboBox, QFrame, QHBoxLayout, QLa
                                QPushButton, QSlider, QVBoxLayout, QWidget)
 
 from engine import PATTERNS, Engine
+import winaudio
 
 VIOLET = QColor("#a855f7")
 VIOLET_LIGHT = QColor("#d8b4fe")
@@ -396,7 +397,8 @@ class Main(QMainWindow):
             combo.blockSignals(False)
         pick_in = cur_in or next((n for _, n in ins if "CABLE Output" in n), "")
         default_name = next((n for i, n in outs if i == default_out and "CABLE" not in n), "")
-        pick_out = cur_out or default_name or next((n for _, n in outs if "CABLE" not in n), "")
+        vxe = next((n for _, n in outs if "VXE V1" in n), "")
+        pick_out = cur_out or vxe or default_name or next((n for _, n in outs if "CABLE" not in n), "")
         if pick_in:
             self.cin.setCurrentText(pick_in)
         if pick_out:
@@ -427,6 +429,7 @@ class Main(QMainWindow):
         s.setValue("mode8d", "true" if self.engine.mode_8d else "false")
         s.setValue("auto", "true" if self.engine.auto else "false")
         self.engine.stop()
+        self.route_windows(False)
         super().closeEvent(e)
 
     def reset(self):
@@ -471,12 +474,34 @@ class Main(QMainWindow):
         elif self.cin.currentData() is not None and "CABLE" in self.cout.currentText():
             self.engine.error = "Выход не должен быть CABLE — выбери наушники."
         else:
-            self.engine.start(self.cin.currentData(), self.cout.currentData())
+            if self.engine.start(self.cin.currentData(), self.cout.currentData()):
+                self.route_windows(True)
         self.refresh()
+
+    def route_windows(self, on):
+        """Весь звук Windows -> CABLE Input, при выключении — обратно."""
+        try:
+            if on:
+                cur = winaudio.get_default_output()
+                cable = winaudio.find_output("CABLE Input")
+                if cable and cur != cable:
+                    self.saved_default = cur
+                    winaudio.set_default_output(cable)
+            elif getattr(self, "saved_default", None):
+                winaudio.set_default_output(self.saved_default)
+                self.saved_default = None
+            elif winaudio.get_default_output() == winaudio.find_output("CABLE Input"):
+                back = winaudio.find_output(self.cout.currentText().split(" (")[-1].rstrip(")"))                     or winaudio.find_output("VXE V1")
+                if back:
+                    winaudio.set_default_output(back)
+        except Exception as ex:  # noqa: BLE001
+            self.engine.error = f"Не удалось переключить звук Windows: {ex}"
+
 
     def toggle(self):
         if self.engine.running:
             self.engine.stop()
+            self.route_windows(False)
             self.refresh()
         else:
             self.start()
@@ -500,7 +525,7 @@ class Main(QMainWindow):
             self.status.setText(f"● В эфире — режим {'8D' if e.mode_8d else '2D'}")
             self.status.setStyleSheet("color: #c084fc;")
         else:
-            self.status.setText("Выключено. Поставь «CABLE Input» звуком по умолчанию в Windows и жми «Включить».")
+            self.status.setText("Выключено. Жми «Включить» — весь звук компа пойдёт через 8D.")
             self.status.setStyleSheet("")
 
 
