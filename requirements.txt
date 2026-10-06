@@ -7,3 +7,4 @@ comtypes>=1.2
 soundfile>=0.12
 pillow>=10  # только для сборки icon.ico
 psutil>=5.9
+av>=12

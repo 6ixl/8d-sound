@@ -47,5 +47,5 @@ python main.py
 ### Сборка .exe
 ```bash
 pip install pyinstaller
-pyinstaller --onefile --windowed --name 8DSound --icon icon.ico --hidden-import comtypes.stream main.py
+pyinstaller --onefile --windowed --name 8DSound --icon icon.ico --hidden-import comtypes.stream --collect-submodules av main.py
 ```
